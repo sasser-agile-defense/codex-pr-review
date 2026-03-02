@@ -97,11 +97,13 @@ detect_pr() {
   local pr_json
 
   if [[ -n "$PR_ARG" ]]; then
-    # Extract number from URL if needed
-    local pr_num
-    pr_num=$(echo "$PR_ARG" | grep -oE '[0-9]+$' || echo "$PR_ARG")
-    pr_json=$(gh pr view "$pr_num" --json number,title,headRefName,baseRefName,url 2>/dev/null) || {
-      echo "Error: Could not find PR #$pr_num" >&2
+    # Pass URLs directly to gh (supports cross-repo); extract number for plain integers
+    local pr_ref="$PR_ARG"
+    if [[ "$PR_ARG" =~ ^[0-9]+$ ]]; then
+      pr_ref="$PR_ARG"
+    fi
+    pr_json=$(gh pr view "$pr_ref" --json number,title,headRefName,baseRefName,url 2>/dev/null) || {
+      echo "Error: Could not find PR $PR_ARG" >&2
       exit 2
     }
   else
@@ -552,7 +554,7 @@ main() {
   # Gather diff
   echo "Gathering diff..." >&2
   local diff
-  diff=$(gh pr diff "$pr_number")
+  diff=$(gh pr diff "$pr_url")
 
   if [[ -z "$diff" ]]; then
     echo "Error: PR diff is empty." >&2
@@ -589,7 +591,7 @@ main() {
   comment=$(format_comment "$WORK_DIR/codex-output.json" "$pr_url")
 
   echo "Posting review to PR #$pr_number..." >&2
-  if ! gh pr comment "$pr_number" --body "$comment" 2>"$WORK_DIR/gh-stderr.log"; then
+  if ! gh pr comment "$pr_url" --body "$comment" 2>"$WORK_DIR/gh-stderr.log"; then
     echo "Error: Failed to post PR comment." >&2
     if [[ -f "$WORK_DIR/gh-stderr.log" ]]; then
       cat "$WORK_DIR/gh-stderr.log" >&2

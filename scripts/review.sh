@@ -132,6 +132,67 @@ gather_project_rules() {
   echo "$rules"
 }
 
+# ─── Prior Review Detection ─────────────────────────────────────────────────
+gather_prior_review() {
+  local pr_number="$1"
+  local repo
+  repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || return 1
+
+  # Fetch all Codex review comment bodies (base64-encoded, one per line)
+  local encoded_bodies
+  encoded_bodies=$(gh api "repos/$repo/issues/$pr_number/comments" \
+    --paginate \
+    --jq '.[] | select(.body | contains("CODEX_REVIEW_DATA_START")) | .body | @base64' 2>/dev/null)
+
+  if [[ -z "$encoded_bodies" ]]; then
+    return 1
+  fi
+
+  # Take the last (most recent) and decode
+  local last_encoded
+  last_encoded=$(echo "$encoded_bodies" | tail -1)
+  local comment_body
+  comment_body=$(echo "$last_encoded" | jq -Rr '@base64d')
+
+  if [[ -z "$comment_body" ]]; then
+    return 1
+  fi
+
+  # Extract review JSON from between markers
+  local review_data
+  review_data=$(echo "$comment_body" | sed -n '/CODEX_REVIEW_DATA_START/,/CODEX_REVIEW_DATA_END/{//d;p;}')
+
+  if [[ -n "$review_data" ]] && echo "$review_data" | jq empty 2>/dev/null; then
+    echo "$review_data"
+    return 0
+  fi
+
+  return 1
+}
+
+# ─── Build Follow-up Context ────────────────────────────────────────────────
+build_followup_context() {
+  local prior_review_json="$1"
+  local review_iteration="$2"
+
+  local template
+  template=$(cat "$SCRIPT_DIR/codex-followup-context.md")
+
+  local prior_verdict prior_confidence prior_explanation prior_findings
+  prior_verdict=$(echo "$prior_review_json" | jq -r '.output.overall_correctness')
+  prior_confidence=$(echo "$prior_review_json" | jq -r '.output.overall_confidence_score')
+  prior_explanation=$(echo "$prior_review_json" | jq -r '.output.overall_explanation')
+  prior_findings=$(echo "$prior_review_json" | jq -c '.output.findings')
+
+  template="${template//\{\{REVIEW_ITERATION\}\}/$review_iteration}"
+  template="${template//\{\{PRIOR_VERDICT\}\}/$prior_verdict}"
+  template="${template//\{\{PRIOR_CONFIDENCE\}\}/$prior_confidence}"
+  template="${template//\{\{PRIOR_EXPLANATION\}\}/$prior_explanation}"
+  template="${template//\{\{PRIOR_FINDINGS\}\}/$prior_findings}"
+
+  echo "$template"
+}
+
 # ─── Build Prompt ─────────────────────────────────────────────────────────────
 build_prompt() {
   local pr_number="$1"
@@ -140,6 +201,7 @@ build_prompt() {
   local base_branch="$4"
   local diff="$5"
   local project_rules="$6"
+  local followup_context="$7"
 
   local template
   template=$(cat "$SCRIPT_DIR/codex-prompt.md")
@@ -151,6 +213,7 @@ build_prompt() {
   fi
 
   template="${template//\{\{PROJECT_RULES\}\}/$project_rules_section}"
+  template="${template//\{\{PRIOR_REVIEW\}\}/$followup_context}"
   template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
   template="${template//\{\{PR_TITLE\}\}/$pr_title}"
   template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
@@ -170,6 +233,7 @@ build_chunk_prompt() {
   local project_rules="$6"
   local chunk_num="$7"
   local total_chunks="$8"
+  local followup_context="$9"
 
   local template
   template=$(cat "$SCRIPT_DIR/codex-chunk-prompt.md")
@@ -180,6 +244,7 @@ build_chunk_prompt() {
   fi
 
   template="${template//\{\{PROJECT_RULES\}\}/$project_rules_section}"
+  template="${template//\{\{PRIOR_REVIEW\}\}/$followup_context}"
   template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
   template="${template//\{\{PR_TITLE\}\}/$pr_title}"
   template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
@@ -199,10 +264,12 @@ build_synthesis_prompt() {
   local base_branch="$4"
   local chunk_results="$5"
   local total_chunks="$6"
+  local followup_context="$7"
 
   local template
   template=$(cat "$SCRIPT_DIR/codex-synthesis-prompt.md")
 
+  template="${template//\{\{PRIOR_REVIEW\}\}/$followup_context}"
   template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
   template="${template//\{\{PR_TITLE\}\}/$pr_title}"
   template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
@@ -224,12 +291,13 @@ review_chunk() {
   local base_branch="$7"
   local project_rules="$8"
   local output_file="$9"
+  local followup_context="${10}"
 
   local chunk_diff
   chunk_diff=$(cat "$chunk_file")
 
   local prompt
-  prompt=$(build_chunk_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_diff" "$project_rules" "$chunk_num" "$total_chunks")
+  prompt=$(build_chunk_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_diff" "$project_rules" "$chunk_num" "$total_chunks" "$followup_context")
 
   local prompt_file="$WORK_DIR/chunk-prompt-${chunk_num}.md"
   echo "$prompt" > "$prompt_file"
@@ -258,11 +326,12 @@ run_single_review() {
   local base_branch="$4"
   local diff="$5"
   local project_rules="$6"
+  local followup_context="$7"
 
   # Build prompt
   echo "Building review prompt..." >&2
   local prompt
-  prompt=$(build_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules")
+  prompt=$(build_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules" "$followup_context")
   echo "$prompt" > "$WORK_DIR/codex-prompt-filled.md"
 
   # Copy schema to work dir
@@ -302,6 +371,7 @@ run_chunked_review() {
   local base_branch="$4"
   local diff="$5"
   local project_rules="$6"
+  local followup_context="$7"
 
   # Copy schema to work dir
   cp "$SCRIPT_DIR/codex-output-schema.json" "$WORK_DIR/"
@@ -326,7 +396,7 @@ run_chunked_review() {
     echo "Only 1 chunk produced, using single review path." >&2
     local single_diff
     single_diff=$(cat "$chunk_dir/chunk_001.diff")
-    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$single_diff" "$project_rules"
+    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$single_diff" "$project_rules" "$followup_context"
     return
   fi
 
@@ -344,7 +414,7 @@ run_chunked_review() {
 
     review_chunk "$chunk_file" "$i" "$total_chunks" \
       "$pr_number" "$pr_title" "$head_branch" "$base_branch" \
-      "$project_rules" "$output_file" &
+      "$project_rules" "$output_file" "$followup_context" &
     pids+=($!)
   done
 
@@ -401,7 +471,7 @@ run_chunked_review() {
 
   # Build and run synthesis prompt
   local synthesis_prompt
-  synthesis_prompt=$(build_synthesis_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_results" "$total_chunks")
+  synthesis_prompt=$(build_synthesis_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_results" "$total_chunks" "$followup_context")
 
   local synthesis_prompt_file="$WORK_DIR/synthesis-prompt.md"
   echo "$synthesis_prompt" > "$synthesis_prompt_file"
@@ -435,6 +505,8 @@ run_chunked_review() {
 format_comment() {
   local output_file="$1"
   local pr_url="$2"
+  local review_iteration="$3"
+  local head_sha="$4"
   local total_findings filtered_count
 
   total_findings=$(jq '.findings | length' "$output_file")
@@ -450,12 +522,29 @@ format_comment() {
     verdict_emoji="❌"
   fi
 
-  # Build comment
+  # Build comment header
   local comment=""
-  comment+="### Codex PR Review ($MODEL)"$'\n\n'
+  if [[ "$review_iteration" -gt 1 ]]; then
+    comment+="### Codex PR Review ($MODEL) — Follow-up #$review_iteration"$'\n\n'
+  else
+    comment+="### Codex PR Review ($MODEL)"$'\n\n'
+  fi
   comment+="**Verdict:** $verdict_emoji $verdict (confidence: $confidence_score)"$'\n\n'
   comment+="**Summary:** $explanation"$'\n\n'
   comment+="---"$'\n\n'
+
+  # Show resolved prior findings for follow-up reviews
+  if [[ "$review_iteration" -gt 1 ]]; then
+    local resolved_count
+    resolved_count=$(jq '[.resolved_prior_findings // [] | length] | .[0]' "$output_file")
+    if [[ "$resolved_count" -gt 0 ]]; then
+      comment+="#### Resolved from Prior Review"$'\n\n'
+      while IFS= read -r resolved_title; do
+        comment+="- ~~${resolved_title}~~"$'\n'
+      done < <(jq -r '.resolved_prior_findings[]' "$output_file")
+      comment+=$'\n'
+    fi
+  fi
 
   if [[ "$filtered_count" -eq 0 ]]; then
     comment+="No findings above confidence threshold ($THRESHOLD)."$'\n\n'
@@ -467,13 +556,14 @@ format_comment() {
     local idx=0
     while IFS= read -r finding; do
       idx=$((idx + 1))
-      local title body priority path start_line end_line conf
+      local title priority path start_line end_line conf status
       title=$(echo "$finding" | jq -r '.title')
       priority=$(echo "$finding" | jq -r '.priority')
       path=$(echo "$finding" | jq -r '.code_location.path')
       start_line=$(echo "$finding" | jq -r '.code_location.start_line')
       end_line=$(echo "$finding" | jq -r '.code_location.end_line')
       conf=$(echo "$finding" | jq -r '.confidence_score')
+      status=$(echo "$finding" | jq -r '.status // "new"')
 
       local priority_label
       case "$priority" in
@@ -489,7 +579,13 @@ format_comment() {
       fi
       location+="\`"
 
-      comment+="| $idx | $priority_label | $title | $location | $conf |"$'\n'
+      # Show status prefix for follow-up reviews
+      local display_title="$title"
+      if [[ "$review_iteration" -gt 1 && "$status" == "persisting" ]]; then
+        display_title="[PERSISTING] $title"
+      fi
+
+      comment+="| $idx | $priority_label | $display_title | $location | $conf |"$'\n'
     done < <(jq -c --arg t "$THRESHOLD" '.findings[] | select(.confidence_score >= ($t | tonumber))' "$output_file" | jq -c '.' | sort -t: -k1 -rn 2>/dev/null || cat)
 
     comment+=$'\n'
@@ -498,7 +594,7 @@ format_comment() {
     idx=0
     while IFS= read -r finding; do
       idx=$((idx + 1))
-      local title body priority path start_line end_line conf
+      local title body priority path start_line end_line conf status
       title=$(echo "$finding" | jq -r '.title')
       body=$(echo "$finding" | jq -r '.body')
       priority=$(echo "$finding" | jq -r '.priority')
@@ -506,6 +602,7 @@ format_comment() {
       start_line=$(echo "$finding" | jq -r '.code_location.start_line')
       end_line=$(echo "$finding" | jq -r '.code_location.end_line')
       conf=$(echo "$finding" | jq -r '.confidence_score')
+      status=$(echo "$finding" | jq -r '.status // "new"')
 
       local priority_label
       case "$priority" in
@@ -515,7 +612,12 @@ format_comment() {
         *) priority_label="INFO" ;;
       esac
 
-      comment+="**$idx. $title** (priority: $priority_label, confidence: $conf)"$'\n'
+      local status_label=""
+      if [[ "$review_iteration" -gt 1 && "$status" == "persisting" ]]; then
+        status_label=" [PERSISTING]"
+      fi
+
+      comment+="**$idx. $title**${status_label} (priority: $priority_label, confidence: $conf)"$'\n'
       comment+="\`${path}:${start_line}-${end_line}\`"$'\n\n'
       comment+="> $body"$'\n\n'
       comment+="---"$'\n\n'
@@ -524,8 +626,28 @@ format_comment() {
     comment+="</details>"$'\n\n'
   fi
 
+  # Footer
+  local iteration_label=""
+  if [[ "$review_iteration" -gt 1 ]]; then
+    iteration_label=" | Follow-up #$review_iteration"
+  fi
   comment+="---"$'\n'
-  comment+="*Reviewed by OpenAI Codex ($MODEL) | Threshold: $THRESHOLD | $total_findings total findings, $filtered_count reported*"
+  comment+="*Reviewed by OpenAI Codex ($MODEL)${iteration_label} | Threshold: $THRESHOLD | $total_findings total findings, $filtered_count reported*"
+
+  # Embed review data for future follow-up reviews
+  local embed_json
+  embed_json=$(jq -c \
+    --argjson iteration "$review_iteration" \
+    --arg sha "$head_sha" \
+    --arg model "$MODEL" \
+    --arg threshold "$THRESHOLD" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{review_iteration: $iteration, head_sha: $sha, model: $model, threshold: ($threshold | tonumber), timestamp: $ts, output: .}' \
+    "$output_file")
+
+  comment+=$'\n\n'"<!-- CODEX_REVIEW_DATA_START"$'\n'
+  comment+="$embed_json"$'\n'
+  comment+="CODEX_REVIEW_DATA_END -->"
 
   echo "$comment"
 }
@@ -548,6 +670,23 @@ main() {
   echo "Reviewing PR #$pr_number: $pr_title" >&2
   echo "  Branch: $head_branch → $base_branch" >&2
   echo "  Model: $MODEL | Threshold: $THRESHOLD | Chunk size: $CHUNK_SIZE" >&2
+
+  # Check for prior Codex reviews
+  echo "Checking for prior Codex reviews..." >&2
+  local prior_review_json="" review_iteration=1 followup_context=""
+  if prior_review_json=$(gather_prior_review "$pr_number"); then
+    local prior_iteration
+    prior_iteration=$(echo "$prior_review_json" | jq -r '.review_iteration // 1')
+    review_iteration=$((prior_iteration + 1))
+    echo "  Found prior review (iteration $prior_iteration). This will be follow-up review #$review_iteration." >&2
+    followup_context=$(build_followup_context "$prior_review_json" "$review_iteration")
+  else
+    echo "  No prior Codex reviews found. This will be the initial review." >&2
+  fi
+
+  # Get current HEAD SHA for embedding
+  local head_sha
+  head_sha=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
   # Gather diff
   echo "Gathering diff..." >&2
@@ -577,19 +716,20 @@ main() {
   # Route: single review vs chunked review
   if [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
     echo "Diff is $diff_lines lines (within chunk size $CHUNK_SIZE), using single review." >&2
-    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules"
+    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules" "$followup_context"
   else
     echo "Diff is $diff_lines lines (exceeds chunk size $CHUNK_SIZE), using chunked review." >&2
-    run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules"
+    run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules" "$followup_context"
   fi
 
   # Format and post (same for both paths — both produce codex-output.json)
   echo "Formatting results..." >&2
   local comment
-  comment=$(format_comment "$WORK_DIR/codex-output.json" "$pr_url")
+  comment=$(format_comment "$WORK_DIR/codex-output.json" "$pr_url" "$review_iteration" "$head_sha")
 
   echo "Posting review to PR #$pr_number..." >&2
-  if ! gh pr comment "$pr_number" --body "$comment" 2>"$WORK_DIR/gh-stderr.log"; then
+  echo "$comment" > "$WORK_DIR/pr-comment.md"
+  if ! gh pr comment "$pr_number" --body-file "$WORK_DIR/pr-comment.md" 2>"$WORK_DIR/gh-stderr.log"; then
     echo "Error: Failed to post PR comment." >&2
     if [[ -f "$WORK_DIR/gh-stderr.log" ]]; then
       cat "$WORK_DIR/gh-stderr.log" >&2
@@ -601,9 +741,10 @@ main() {
   fi
 
   # Output summary JSON for Claude to parse
-  local filtered_count total_findings
+  local filtered_count total_findings resolved_count
   total_findings=$(jq '.findings | length' "$WORK_DIR/codex-output.json")
   filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(.confidence_score >= ($t | tonumber))] | length' "$WORK_DIR/codex-output.json")
+  resolved_count=$(jq '[.resolved_prior_findings // [] | length] | .[0]' "$WORK_DIR/codex-output.json")
 
   jq -n \
     --arg pr_url "$pr_url" \
@@ -613,6 +754,8 @@ main() {
     --arg explanation "$(jq -r '.overall_explanation' "$WORK_DIR/codex-output.json")" \
     --argjson total "$total_findings" \
     --argjson reported "$filtered_count" \
+    --argjson resolved "$resolved_count" \
+    --argjson iteration "$review_iteration" \
     --arg threshold "$THRESHOLD" \
     --arg model "$MODEL" \
     '{
@@ -621,11 +764,13 @@ main() {
       pr_number: $pr_number,
       model: $model,
       threshold: $threshold,
+      review_iteration: $iteration,
       verdict: $verdict,
       overall_confidence: $confidence,
       explanation: $explanation,
       total_findings: $total,
-      reported_findings: $reported
+      reported_findings: $reported,
+      resolved_findings: $resolved
     }'
 
   echo "Review posted to $pr_url" >&2

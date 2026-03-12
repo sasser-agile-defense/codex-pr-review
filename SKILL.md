@@ -4,7 +4,7 @@ description: Review a pull request using OpenAI Codex (gpt-5.3-codex). Use when 
 license: MIT
 metadata:
   author: sasser
-  version: 0.2.0
+  version: 0.3.0
 allowed-tools: Bash
 argument-hint: "[PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL] [--chunk-size INT] [--max-diff-lines INT]"
 ---
@@ -53,6 +53,22 @@ PRs with diffs exceeding the chunk size (default 5,000 lines) are automatically 
 
 This allows reviewing PRs of 100K+ lines without truncation. Use `--chunk-size` to tune the chunk size (smaller = more parallelism but more synthesis overhead).
 
+## Follow-up Review Detection
+
+When a PR has been reviewed before, subsequent reviews automatically detect prior findings and operate as follow-up reviews:
+
+1. Prior Codex review comments are detected via embedded metadata in PR comments
+2. The reviewer receives the full context of prior findings (verdict, confidence, all findings)
+3. The follow-up review assesses which prior findings have been resolved and which persist
+4. New issues introduced by fix commits are flagged alongside persisting issues
+5. The PR comment shows resolved findings (struck through), persisting findings (labeled `[PERSISTING]`), and the review iteration number
+
+This is fully automatic — just run `/codex-pr-review` again after pushing fixes. The review will reference the most recent prior Codex review.
+
+The summary JSON output includes additional fields for follow-up reviews:
+- `review_iteration`: which review iteration this is (1 = initial, 2+ = follow-up)
+- `resolved_findings`: count of prior findings that were resolved
+
 ## How to Execute This Skill
 
 When this skill is invoked, run the review script:
@@ -77,6 +93,7 @@ After the script succeeds, inform the user:
 - How many findings were found vs. how many passed the threshold
 - The overall correctness verdict and confidence
 - That the review has been posted as a PR comment (with link)
+- For follow-up reviews: the review iteration number, how many prior findings were resolved, and how many persist
 
 ### Error Handling
 

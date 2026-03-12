@@ -29,6 +29,8 @@ Focus on issues that impact:
 
 {{PROJECT_RULES}}
 
+{{PRIOR_REVIEW}}
+
 ## Pull Request Information
 
 **PR:** #{{PR_NUMBER}} — {{PR_TITLE}}

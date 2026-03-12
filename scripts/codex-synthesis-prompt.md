@@ -30,6 +30,8 @@ The following JSON array contains the review output from each chunk:
 - Cross-chunk pattern findings should cite specific files and lines from the chunk results.
 - The final output must use the same JSON schema as individual chunk reviews.
 
+{{PRIOR_REVIEW}}
+
 ## Pull Request Information
 
 **PR:** #{{PR_NUMBER}} — {{PR_TITLE}}

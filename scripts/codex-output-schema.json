@@ -46,6 +46,11 @@
             },
             "required": ["path", "start_line", "end_line"],
             "additionalProperties": false
+          },
+          "status": {
+            "type": "string",
+            "enum": ["new", "persisting"],
+            "description": "Whether this is a new finding or one persisting from a prior review. Omit or use 'new' for initial reviews."
           }
         },
         "required": ["title", "body", "confidence_score", "priority", "code_location"],
@@ -66,6 +71,18 @@
       "minimum": 0,
       "maximum": 1,
       "description": "Confidence in the overall verdict (0-1)"
+    },
+    "review_iteration": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Which review iteration this is (1 = initial, 2+ = follow-up)"
+    },
+    "resolved_prior_findings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Titles of prior review findings that have been resolved. Empty array for initial reviews."
     }
   },
   "required": ["findings", "overall_correctness", "overall_explanation", "overall_confidence_score"],

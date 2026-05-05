@@ -258,6 +258,8 @@ JSON
   printf 'SCRIPT_DIR=%q\n' "$SCRIPTS_DIR"
   printf 'WORK_DIR=%q\n' "$fmt_work"
   echo 'MODEL="gpt-5.3-codex"'
+  echo 'MODEL_CODEX="gpt-5.3-codex"'
+  echo 'MODEL_CLAUDE="claude-opus-4-7"'
   echo 'THRESHOLD="0.8"'
   extract_fn "format_comment"
 } > "$fmt_helpers"

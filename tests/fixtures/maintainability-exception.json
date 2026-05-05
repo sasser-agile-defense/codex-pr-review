@@ -1,0 +1,22 @@
+{
+  "findings": [
+    {
+      "title": "Cyclomatic complexity of unchanged helper is high",
+      "body": "The helper at line 50 has high cyclomatic complexity. It is not in the diff hunk but it is referenced from the new code added in this PR; addressing complexity here would help maintainability.",
+      "confidence_score": 0.9,
+      "priority": 1,
+      "code_location": {"path": "lib/big.py", "start_line": 50, "end_line": 80},
+      "status": "new",
+      "source": "claude",
+      "verifier_verdict": "confirmed",
+      "agreement": "claude-only",
+      "category": "maintainability",
+      "suggested_fix": "Refactor the helper to reduce branching."
+    }
+  ],
+  "overall_correctness": "correct",
+  "overall_explanation": "Single maintainability finding outside hunks but in a touched file.",
+  "overall_confidence_score": 0.9,
+  "review_iteration": 1,
+  "resolved_prior_findings": []
+}

@@ -1,0 +1,10 @@
+diff --git a/lib/big.py b/lib/big.py
+index aaa..bbb 100644
+--- a/lib/big.py
++++ b/lib/big.py
+@@ -200,3 +200,6 @@ def existing_func():
+     return 42
+
++def new_helper():
++    return existing_func() + 1
++

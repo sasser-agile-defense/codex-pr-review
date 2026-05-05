@@ -1,0 +1,30 @@
+diff --git a/src/handler.go b/src/handler.go
+index aaa..bbb 100644
+--- a/src/handler.go
++++ b/src/handler.go
+@@ -10,7 +10,12 @@ package handler
+ import "fmt"
+
+-func Handle(req Request) {
+-    fmt.Println(req)
++func Handle(req Request) error {
++    if req.Body == nil {
++        return errEmpty
++    }
++    fmt.Println(req)
++    return nil
+ }
++
++var errEmpty = fmt.Errorf("empty body")
+diff --git a/src/util.py b/src/util.py
+index ccc..ddd 100644
+--- a/src/util.py
++++ b/src/util.py
+@@ -50,6 +50,9 @@ def existing():
+     return True
+
++def new_helper(x):
++    return x * 2
++
+ def other():
+     pass

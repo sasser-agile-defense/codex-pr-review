@@ -1,0 +1,113 @@
+{
+  "findings": [
+    {
+      "title": "Valid finding inside handler.go hunk",
+      "body": "Function returns nil but caller may dereference.",
+      "confidence_score": 0.92,
+      "priority": 2,
+      "code_location": {"path": "src/handler.go", "start_line": 13, "end_line": 14},
+      "status": "new",
+      "source": "codex",
+      "verifier_verdict": "confirmed",
+      "agreement": "both",
+      "category": "correctness",
+      "suggested_fix": "Add a nil-check before dereferencing the return value."
+    },
+    {
+      "title": "Valid finding inside util.py hunk",
+      "body": "new_helper has no docstring.",
+      "confidence_score": 0.85,
+      "priority": 1,
+      "code_location": {"path": "src/util.py", "start_line": 53, "end_line": 54},
+      "status": "new",
+      "source": "claude",
+      "verifier_verdict": "confirmed",
+      "agreement": "both",
+      "category": "style",
+      "suggested_fix": "Add a one-line docstring."
+    },
+    {
+      "title": "Valid deterministic finding",
+      "body": "ruff E501 line too long",
+      "confidence_score": 1.0,
+      "priority": 1,
+      "code_location": {"path": "src/util.py", "start_line": 53, "end_line": 53},
+      "status": "new",
+      "source": "deterministic",
+      "verifier_verdict": "n/a",
+      "agreement": "deterministic",
+      "category": "style",
+      "suggested_fix": "Reformat to under 100 chars."
+    },
+    {
+      "title": "Outside any hunk in handler.go (drop)",
+      "body": "This finding cites line 999 of handler.go which is far outside the modified hunk.",
+      "confidence_score": 0.95,
+      "priority": 2,
+      "code_location": {"path": "src/handler.go", "start_line": 999, "end_line": 999},
+      "status": "new",
+      "source": "codex",
+      "verifier_verdict": "confirmed",
+      "agreement": "codex-only",
+      "category": "correctness",
+      "suggested_fix": "n/a"
+    },
+    {
+      "title": "Outside any hunk in util.py (drop)",
+      "body": "This finding cites line 800 of util.py which is far outside the modified hunk.",
+      "confidence_score": 0.9,
+      "priority": 2,
+      "code_location": {"path": "src/util.py", "start_line": 800, "end_line": 802},
+      "status": "new",
+      "source": "claude",
+      "verifier_verdict": "confirmed",
+      "agreement": "claude-only",
+      "category": "performance",
+      "suggested_fix": "n/a"
+    },
+    {
+      "title": "File not in diff (drop)",
+      "body": "Cites a file that was not changed in this PR at all.",
+      "confidence_score": 0.99,
+      "priority": 3,
+      "code_location": {"path": "src/never_touched.go", "start_line": 5, "end_line": 5},
+      "status": "new",
+      "source": "codex",
+      "verifier_verdict": "confirmed",
+      "agreement": "codex-only",
+      "category": "correctness",
+      "suggested_fix": "n/a"
+    },
+    {
+      "title": "Empty body (drop)",
+      "body": "",
+      "confidence_score": 0.95,
+      "priority": 2,
+      "code_location": {"path": "src/handler.go", "start_line": 13, "end_line": 13},
+      "status": "new",
+      "source": "claude",
+      "verifier_verdict": "confirmed",
+      "agreement": "both",
+      "category": "correctness",
+      "suggested_fix": "n/a"
+    },
+    {
+      "title": "Below threshold (drop)",
+      "body": "Confidence is too low to surface.",
+      "confidence_score": 0.5,
+      "priority": 1,
+      "code_location": {"path": "src/handler.go", "start_line": 14, "end_line": 14},
+      "status": "new",
+      "source": "claude",
+      "verifier_verdict": "inconclusive",
+      "agreement": "unconfirmed-by-codex",
+      "category": "style",
+      "suggested_fix": "n/a"
+    }
+  ],
+  "overall_correctness": "needs-changes",
+  "overall_explanation": "Mixed input for the location validator unit test.",
+  "overall_confidence_score": 0.8,
+  "review_iteration": 1,
+  "resolved_prior_findings": []
+}

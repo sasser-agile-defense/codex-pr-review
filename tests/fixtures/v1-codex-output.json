@@ -1,0 +1,25 @@
+{
+  "findings": [
+    {
+      "title": "Possible nil deref in Handle",
+      "body": "If req.Body is nil, the call at line 13 will panic.",
+      "confidence_score": 0.92,
+      "priority": 2,
+      "code_location": {"path": "src/handler.go", "start_line": 13, "end_line": 14},
+      "status": "new"
+    },
+    {
+      "title": "Missing docstring on new helper",
+      "body": "new_helper has no docstring.",
+      "confidence_score": 0.85,
+      "priority": 1,
+      "code_location": {"path": "src/util.py", "start_line": 53, "end_line": 54},
+      "status": "new"
+    }
+  ],
+  "overall_correctness": "patch is correct",
+  "overall_explanation": "v1-shaped output for back-compat test.",
+  "overall_confidence_score": 0.9,
+  "review_iteration": 1,
+  "resolved_prior_findings": []
+}

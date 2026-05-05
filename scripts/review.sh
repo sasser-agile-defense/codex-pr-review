@@ -2150,7 +2150,24 @@ merge_det_into_output() {
   fi
 }
 
-# ─── Format Comment ──────────────────────────────────────────────────────────
+# ─── Format Comment (v2 P5 spec §4.7 layout) ─────────────────────────────────
+# Renders a PR comment per spec §4.7:
+#   ## Codex PR Review v2 — Iteration N (mode)
+#   **Verdict:** <v2 enum> (confidence X)
+#   ### Resolved since last review (N)            (only when mode != initial)
+#   ### Findings (N)
+#     #### [agreement-badges] [Pn] file:line — title
+#     > body
+#     >
+#     > **Suggested fix:** ...
+#   ### Persisting from prior review (N)          (only when mode != initial)
+#   ---
+#   <!-- codex-pr-review:meta v=2 ... -->         (P4 sentinel preserved)
+#   <!-- CODEX_REVIEW_DATA_START ... END -->      (v1 rollback preserved)
+#
+# Compatibility shim: v1 verdict strings are mapped to the v2 enum BEFORE
+# rendering so a v1 Codex output flowing through v2 format_comment (e.g.,
+# during a `--no-verify` debug run) produces sensible output.
 format_comment() {
   local output_file="$1"
   local pr_url="$2"
@@ -2166,15 +2183,11 @@ format_comment() {
   confidence_score=$(jq -r '.overall_confidence_score' "$output_file")
   explanation=$(jq -r '.overall_explanation' "$output_file")
 
-  local verdict_emoji="✅"
-  if [[ "$verdict" == "patch is incorrect" ]]; then
-    verdict_emoji="❌"
-  fi
+  # v1 → v2 verdict shim. Required so a v1-shaped synthesis output flowing
+  # through v2 format_comment renders the v2 enum verbatim. Spec §11.
+  verdict=$(echo "$verdict" | sed 's/patch is correct/correct/; s/patch is incorrect/needs-changes/')
 
   # ── Iteration metadata (v2 P4) ───────────────────────────────────────────
-  # Read iteration-meta.json (written by main()) and the synthesis output's
-  # `delta` block (if present) to drive the mode-aware header and the
-  # Resolved/Persisting sections.
   local iter_meta_file="$WORK_DIR/iteration-meta.json"
   local iter_mode="initial" iter_prior_sha=""
   if [[ -f "$iter_meta_file" ]] && jq empty "$iter_meta_file" 2>/dev/null; then
@@ -2190,101 +2203,125 @@ format_comment() {
     *)                     iter_label_human="$iter_mode" ;;
   esac
 
-  # Build comment header
+  # ── Header + Verdict ─────────────────────────────────────────────────────
   local comment=""
-  if [[ "$review_iteration" -gt 1 ]]; then
-    comment+="## Codex PR Review v2 — Iteration $review_iteration ($iter_label_human)"$'\n\n'
-  else
-    comment+="## Codex PR Review v2 — Iteration $review_iteration ($iter_label_human)"$'\n\n'
+  comment+="## Codex PR Review v2 — Iteration $review_iteration ($iter_label_human)"$'\n\n'
+  comment+="**Verdict:** $verdict (confidence $confidence_score)"$'\n\n'
+  if [[ -n "$explanation" && "$explanation" != "null" ]]; then
+    comment+="$explanation"$'\n\n'
   fi
-  comment+="**Verdict:** $verdict_emoji $verdict (confidence: $confidence_score)"$'\n\n'
-  comment+="**Summary:** $explanation"$'\n\n'
-  comment+="---"$'\n\n'
 
-  # ── Resolved-since-last-review section (v2 P4) ───────────────────────────
-  # Source order, in priority:
-  #   1. synthesis output's iteration_meta.delta.resolved (preferred — populated
-  #      by the synthesizer per spec §4.5).
-  #   2. legacy resolved_prior_findings array (v1 carry-over).
-  if [[ "$iter_mode" == "followup-after-fixes" || "$iter_mode" == "delta-since-prior" ]]; then
-    local resolved_titles_file="$WORK_DIR/_resolved_titles.txt"
-    : > "$resolved_titles_file"
-    if jq -e '.iteration_meta.delta.resolved // empty | length > 0' "$output_file" >/dev/null 2>&1; then
-      jq -r '.iteration_meta.delta.resolved[]?' "$output_file" >> "$resolved_titles_file" 2>/dev/null || true
-    fi
-    if [[ ! -s "$resolved_titles_file" ]] && jq -e '(.resolved_prior_findings // []) | length > 0' "$output_file" >/dev/null 2>&1; then
-      jq -r '.resolved_prior_findings[]?' "$output_file" >> "$resolved_titles_file" 2>/dev/null || true
+  # ── Resolved since last review (mode != initial) ─────────────────────────
+  if [[ "$iter_mode" != "initial" ]]; then
+    local resolved_buf="$WORK_DIR/_resolved_titles.json"
+    : > "$resolved_buf"
+    # Prefer top-level delta.resolved (P5 schema), then iteration_meta.delta.resolved
+    # (P4 schema), then resolved_prior_findings (v1 carry-over).
+    if jq -e '.delta.resolved // empty | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -c '.delta.resolved[]?' "$output_file" >> "$resolved_buf" 2>/dev/null || true
+    elif jq -e '.iteration_meta.delta.resolved // empty | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -c '.iteration_meta.delta.resolved[]?' "$output_file" >> "$resolved_buf" 2>/dev/null || true
+    elif jq -e '(.resolved_prior_findings // []) | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -c '.resolved_prior_findings[]?' "$output_file" >> "$resolved_buf" 2>/dev/null || true
     fi
     local resolved_count
-    resolved_count=$(wc -l < "$resolved_titles_file" | tr -d ' ')
+    resolved_count=$(wc -l < "$resolved_buf" | tr -d ' ')
     if [[ "$resolved_count" -gt 0 ]]; then
       comment+="### Resolved since last review ($resolved_count)"$'\n\n'
-      while IFS= read -r resolved_title; do
-        [[ -z "$resolved_title" ]] && continue
-        comment+="- ~~${resolved_title}~~"$'\n'
-      done < "$resolved_titles_file"
+      while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        local line
+        line=$(printf '%s' "$entry" | jq -r '
+          if type == "string" then
+            "- ~~" + . + "~~"
+          elif type == "object" then
+            "- ~~`\(.code_location.path // "?"):\(.code_location.start_line // 0)` — \(.title // "(no title)")~~"
+          else
+            "- ~~" + tostring + "~~"
+          end
+        ' 2>/dev/null || echo "- ~~${entry}~~")
+        comment+="${line}"$'\n'
+      done < "$resolved_buf"
       comment+=$'\n'
     fi
   fi
 
+  # ── Findings (N) — fenced sub-block per finding ──────────────────────────
   if [[ "$filtered_count" -eq 0 ]]; then
+    comment+="### Findings (0)"$'\n\n'
     comment+="No findings above confidence threshold ($THRESHOLD)."$'\n\n'
   else
-    comment+="#### Findings ($filtered_count above threshold $THRESHOLD)"$'\n\n'
-    comment+="| # | Priority | Finding | Location | Confidence |"$'\n'
-    comment+="|---|----------|---------|----------|------------|"$'\n'
+    comment+="### Findings ($filtered_count)"$'\n\n'
 
-    local idx=0
     while IFS= read -r finding; do
-      idx=$((idx + 1))
-      local title priority path start_line end_line conf status agreement verifier_verdict
-      title=$(echo "$finding" | jq -r '.title')
-      priority=$(echo "$finding" | jq -r '.priority')
-      path=$(echo "$finding" | jq -r '.code_location.path')
-      start_line=$(echo "$finding" | jq -r '.code_location.start_line')
-      end_line=$(echo "$finding" | jq -r '.code_location.end_line')
-      conf=$(echo "$finding" | jq -r '.confidence_score')
+      local title body priority path start_line end_line status agreement source verifier_verdict suggested_fix
+      title=$(echo "$finding" | jq -r '.title // ""')
+      body=$(echo "$finding" | jq -r '.body // ""')
+      priority=$(echo "$finding" | jq -r '.priority // 0')
+      path=$(echo "$finding" | jq -r '.code_location.path // "?"')
+      start_line=$(echo "$finding" | jq -r '.code_location.start_line // 0')
+      end_line=$(echo "$finding" | jq -r '.code_location.end_line // 0')
       status=$(echo "$finding" | jq -r '.status // "new"')
       agreement=$(echo "$finding" | jq -r '.agreement // ""')
+      source=$(echo "$finding" | jq -r '.source // ""')
       verifier_verdict=$(echo "$finding" | jq -r '.verifier_verdict // ""')
+      suggested_fix=$(echo "$finding" | jq -r '.suggested_fix // ""')
 
-      local priority_label
-      case "$priority" in
-        3) priority_label="HIGH" ;;
-        2) priority_label="MEDIUM" ;;
-        1) priority_label="LOW" ;;
-        *) priority_label="INFO" ;;
-      esac
-
-      local location="\`${path}:${start_line}"
-      if [[ "$start_line" != "$end_line" ]]; then
-        location+="-${end_line}"
-      fi
-      location+="\`"
-
-      # v2: prepend agreement badge.
-      local badge=""
+      # Agreement badges. Multiple badges are allowed but the verifier flow
+      # only ever produces one of these per finding in practice.
+      local badges=""
       case "$agreement" in
-        both)                  badge="[both] " ;;
-        codex-only)            badge="[codex-only] " ;;
-        claude-only)           badge="[claude-only] " ;;
-        unconfirmed-by-codex)  badge="[unconfirmed-by-codex] " ;;
-        unconfirmed-by-claude) badge="[unconfirmed-by-claude] " ;;
-        deterministic)         badge="[deterministic] " ;;
-        "")                    badge="" ;;
-        *)                     badge="[${agreement}] " ;;
+        both)                  badges="[both]" ;;
+        codex-only)            badges="[codex-only]" ;;
+        claude-only)           badges="[claude-only]" ;;
+        unconfirmed-by-codex)  badges="[unconfirmed-by-codex]" ;;
+        unconfirmed-by-claude) badges="[unconfirmed-by-claude]" ;;
+        deterministic)         badges="[deterministic]" ;;
+        "")                    badges="" ;;
+        *)                     badges="[${agreement}]" ;;
       esac
-
-      # Show status prefix for follow-up reviews
-      local display_title="${badge}${title}"
-      if [[ "$review_iteration" -gt 1 && "$status" == "persisting" ]]; then
-        display_title="[PERSISTING] ${badge}$title"
+      # Add [deterministic] alongside the agreement badge if source says so
+      # but the agreement label didn't (defensive — synthesizer should set
+      # agreement=deterministic for source=deterministic).
+      if [[ "$source" == "deterministic" && "$badges" != *"[deterministic]"* ]]; then
+        if [[ -n "$badges" ]]; then
+          badges="$badges [deterministic]"
+        else
+          badges="[deterministic]"
+        fi
       fi
 
-      comment+="| $idx | $priority_label | $display_title | $location | $conf |"$'\n'
+      local location="${path}:${start_line}"
+      if [[ "$start_line" != "$end_line" && "$end_line" != "0" ]]; then
+        location="${path}:${start_line}-${end_line}"
+      fi
+
+      # Header: #### [badges] [Pn] file:line — title
+      local header="#### "
+      if [[ -n "$badges" ]]; then
+        header+="$badges "
+      fi
+      header+="[P${priority}] \`${location}\` — ${title}"
+      if [[ "$review_iteration" -gt 1 && "$status" == "persisting" ]]; then
+        header+=" [PERSISTING]"
+      fi
+      comment+="${header}"$'\n'
+
+      # Body block (each line prefixed with `> ` so it renders as a quote
+      # in GitHub markdown).
+      local body_quoted
+      body_quoted=$(printf '%s' "$body" | sed 's/^/> /')
+      comment+="${body_quoted}"$'\n'
+      comment+=">"$'\n'
+      if [[ -n "$suggested_fix" && "$suggested_fix" != "null" ]]; then
+        comment+="> **Suggested fix:** ${suggested_fix}"$'\n'
+      else
+        comment+="> **Suggested fix:** (none provided)"$'\n'
+      fi
+      comment+=$'\n'
     done < <(jq -c --arg t "$THRESHOLD" '
-      # P3 sort: priority desc → deterministic findings first within each
-      # priority bucket → title alphabetical (stable tiebreaker).
+      # P3 sort order preserved: priority desc → deterministic first within
+      # each priority bucket → title alphabetical (stable tiebreaker).
       [.findings[] | select(.confidence_score >= ($t | tonumber))]
       | sort_by([
           -((.priority // 0)),
@@ -2293,94 +2330,29 @@ format_comment() {
         ])
       | .[]
     ' "$output_file")
-
-    comment+=$'\n'
-    comment+="<details><summary>Detailed findings</summary>"$'\n\n'
-
-    idx=0
-    while IFS= read -r finding; do
-      idx=$((idx + 1))
-      local title body priority path start_line end_line conf status agreement verifier_verdict
-      title=$(echo "$finding" | jq -r '.title')
-      body=$(echo "$finding" | jq -r '.body')
-      priority=$(echo "$finding" | jq -r '.priority')
-      path=$(echo "$finding" | jq -r '.code_location.path')
-      start_line=$(echo "$finding" | jq -r '.code_location.start_line')
-      end_line=$(echo "$finding" | jq -r '.code_location.end_line')
-      conf=$(echo "$finding" | jq -r '.confidence_score')
-      status=$(echo "$finding" | jq -r '.status // "new"')
-      agreement=$(echo "$finding" | jq -r '.agreement // ""')
-      verifier_verdict=$(echo "$finding" | jq -r '.verifier_verdict // ""')
-
-      local priority_label
-      case "$priority" in
-        3) priority_label="HIGH" ;;
-        2) priority_label="MEDIUM" ;;
-        1) priority_label="LOW" ;;
-        *) priority_label="INFO" ;;
-      esac
-
-      local status_label=""
-      if [[ "$review_iteration" -gt 1 && "$status" == "persisting" ]]; then
-        status_label=" [PERSISTING]"
-      fi
-
-      local badge=""
-      case "$agreement" in
-        both)                  badge="[both] " ;;
-        codex-only)            badge="[codex-only] " ;;
-        claude-only)           badge="[claude-only] " ;;
-        unconfirmed-by-codex)  badge="[unconfirmed-by-codex] " ;;
-        unconfirmed-by-claude) badge="[unconfirmed-by-claude] " ;;
-        deterministic)         badge="[deterministic] " ;;
-        "")                    badge="" ;;
-        *)                     badge="[${agreement}] " ;;
-      esac
-
-      comment+="**$idx. ${badge}$title**${status_label} (priority: $priority_label, confidence: $conf)"$'\n'
-      comment+="\`${path}:${start_line}-${end_line}\`"$'\n\n'
-      comment+="> $body"$'\n\n'
-      comment+="---"$'\n\n'
-    done < <(jq -c --arg t "$THRESHOLD" '
-      [.findings[] | select(.confidence_score >= ($t | tonumber))]
-      | sort_by([
-          -((.priority // 0)),
-          (if (.source // "") == "deterministic" then 0 else 1 end),
-          (.title // "")
-        ])
-      | .[]
-    ' "$output_file")
-
-    comment+="</details>"$'\n\n'
   fi
 
-  # Footer
-  local iteration_label=""
-  if [[ "$review_iteration" -gt 1 ]]; then
-    iteration_label=" | Follow-up #$review_iteration"
-  fi
-
-  # ── Persisting-from-prior-review section (v2 P4, delta-since-prior only) ──
-  if [[ "$iter_mode" == "delta-since-prior" ]]; then
+  # ── Persisting from prior review (mode != initial) ───────────────────────
+  if [[ "$iter_mode" != "initial" ]]; then
     local persisting_buf="$WORK_DIR/_persisting_titles.json"
     : > "$persisting_buf"
-    if jq -e '.iteration_meta.delta.persisting // empty | length > 0' "$output_file" >/dev/null 2>&1; then
+    if jq -e '.delta.persisting // empty | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -c '.delta.persisting[]?' "$output_file" >> "$persisting_buf" 2>/dev/null || true
+    elif jq -e '.iteration_meta.delta.persisting // empty | length > 0' "$output_file" >/dev/null 2>&1; then
       jq -c '.iteration_meta.delta.persisting[]?' "$output_file" >> "$persisting_buf" 2>/dev/null || true
     fi
     local persisting_count
     persisting_count=$(wc -l < "$persisting_buf" | tr -d ' ')
     if [[ "$persisting_count" -gt 0 ]]; then
-      comment+=$'\n'"### Persisting from prior review ($persisting_count)"$'\n\n'
+      comment+="### Persisting from prior review ($persisting_count)"$'\n\n'
       while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
-        # Each `entry` may be either a plain string (title) or a finding-shaped
-        # object. We render both shapes for resilience.
         local rendered
         rendered=$(printf '%s' "$entry" | jq -r '
           if type == "string" then
-            "- [persisting] " + .
+            "- [persisting] " + . + " — same issue, not addressed."
           elif type == "object" then
-            "- [persisting] [P\(.priority // 0)] `\(.code_location.path // "?"):\(.code_location.start_line // 0)` — \(.title // "(no title)")"
+            "- [persisting] [P\(.priority // 0)] `\(.code_location.path // "?"):\(.code_location.start_line // 0)` — \(.title // "(no title)") — same issue, not addressed."
           else
             "- [persisting] " + tostring
           end
@@ -2400,24 +2372,21 @@ format_comment() {
     stats_failed=$(sed -n '2p' "$WORK_DIR/chunk-stats.txt")
     if [[ "$stats_failed" -gt 0 ]]; then
       local total_c=$((stats_succeeded + stats_failed))
-      comment+="> ⚠️ **Incomplete coverage:** ${stats_failed} of ${total_c} chunks failed during review. Findings below reflect only the ${stats_succeeded} successful chunks. Consider retrying or reducing \`--max-parallel\`."$'\n\n'
+      comment+=$'\n'"> ⚠️ **Incomplete coverage:** ${stats_failed} of ${total_c} chunks failed during review. Findings reflect only the ${stats_succeeded} successful chunks. Consider retrying or reducing \`--max-parallel\`."$'\n'
     fi
   fi
 
-  comment+="*Reviewed by OpenAI Codex ($MODEL)${iteration_label} | Threshold: $THRESHOLD | $total_findings total findings, $filtered_count reported*"
+  local iteration_label=""
+  if [[ "$review_iteration" -gt 1 ]]; then
+    iteration_label=" | Follow-up #$review_iteration"
+  fi
+  comment+=$'\n'"*Reviewed by codex-pr-review v2 (codex=$MODEL_CODEX, claude=$MODEL_CLAUDE)${iteration_label} | Threshold: $THRESHOLD | $total_findings total findings, $filtered_count reported*"
 
   # ── v2 sentinel (compact, machine-parseable; primary in v2) ──────────────
-  # P4's iteration classifier reads this first; falls back to the legacy
-  # CODEX_REVIEW_DATA_START block below for v1 back-compat. Mode and prior_sha
-  # are appended in v2 P4 so the next iteration can compute its own delta.
-  local sanitized_verdict="$verdict"
-  case "$sanitized_verdict" in
-    "patch is correct")    sanitized_verdict="correct" ;;
-    "patch is incorrect")  sanitized_verdict="needs-changes" ;;
-  esac
-  comment+=$'\n\n'"<!-- codex-pr-review:meta v=2 sha=${head_sha} iteration=${review_iteration} findings=${filtered_count} verdict=${sanitized_verdict} mode=${iter_mode} prior_sha=${iter_prior_sha} -->"
+  comment+=$'\n\n'"<!-- codex-pr-review:meta v=2 sha=${head_sha} iteration=${review_iteration} findings=${filtered_count} verdict=${verdict} mode=${iter_mode} prior_sha=${iter_prior_sha} -->"
 
-  # Embed review data for future follow-up reviews (v1 back-compat)
+  # ── Legacy CODEX_REVIEW_DATA_START block (v1 rollback). Preserved per spec
+  # §11; allows a v2→v1 downgrade to keep the iteration counter.
   local embed_json
   embed_json=$(jq -c \
     --argjson iteration "$review_iteration" \
@@ -2630,6 +2599,34 @@ main() {
   fi
   merge_det_into_output "$WORK_DIR/codex-output.json" "$WORK_DIR/det-findings.json"
 
+  # ─── Location validator (v2 P5) ───────────────────────────────────────────
+  # Deterministic post-synthesis filter: drops findings whose code_location
+  # does not resolve into the diff (file missing, line outside hunks),
+  # findings with empty body, missing confidence_score, or confidence_score
+  # below THRESHOLD. The maintainability category is exempted from the
+  # outside-hunks check (some maintainability findings legitimately point at
+  # unchanged-but-related lines in touched files).
+  if [[ -x "$SCRIPT_DIR/location-validator.sh" ]] && [[ -f "$WORK_DIR/codex-output.json" ]]; then
+    local validated_file="$WORK_DIR/codex-output-validated.json"
+    if THRESHOLD="$THRESHOLD" bash "$SCRIPT_DIR/location-validator.sh" \
+        "$WORK_DIR/codex-output.json" "$diff_file" "$validated_file" \
+        2>>"$WORK_DIR/location-validator.log"; then
+      # Surface the validator's stderr summary on the user's terminal too.
+      if [[ -s "$WORK_DIR/location-validator.log" ]]; then
+        sed -e 's/^/  /' "$WORK_DIR/location-validator.log" >&2 || true
+      fi
+      if [[ -s "$validated_file" ]] && jq empty "$validated_file" 2>/dev/null; then
+        mv "$validated_file" "$WORK_DIR/codex-output.json"
+      else
+        echo "Note: location-validator.sh produced an unusable output; keeping pre-validation findings." >&2
+      fi
+    else
+      echo "Note: location-validator.sh failed; keeping pre-validation findings." >&2
+      [[ -s "$WORK_DIR/location-validator.log" ]] && \
+        sed -e 's/^/  /' "$WORK_DIR/location-validator.log" >&2 || true
+    fi
+  fi
+
   # Format and post (same for both paths — both produce codex-output.json)
   echo "Formatting results..." >&2
   local comment
@@ -2648,24 +2645,54 @@ main() {
     exit 4
   fi
 
-  # Output summary JSON for Claude to parse
-  local filtered_count total_findings resolved_count
+  # Output summary JSON for Claude to parse (v2: adds verdict mapped to v2
+  # enum, agreement_summary counts, and a delta block on follow-up runs).
+  local filtered_count total_findings resolved_count raw_verdict v2_verdict
   total_findings=$(jq '.findings | length' "$WORK_DIR/codex-output.json")
   filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(.confidence_score >= ($t | tonumber))] | length' "$WORK_DIR/codex-output.json")
   resolved_count=$(jq '[.resolved_prior_findings // [] | length] | .[0]' "$WORK_DIR/codex-output.json")
+  raw_verdict=$(jq -r '.overall_correctness' "$WORK_DIR/codex-output.json")
+  # Same v1→v2 verdict shim format_comment uses (kept consistent).
+  v2_verdict=$(echo "$raw_verdict" | sed 's/patch is correct/correct/; s/patch is incorrect/needs-changes/')
+
+  # Agreement summary: count how many findings carry each agreement label.
+  local agreement_summary
+  agreement_summary=$(jq --arg t "$THRESHOLD" '
+    [.findings[] | select(.confidence_score >= ($t | tonumber))] as $f
+    | {
+        both:                  ($f | map(select(.agreement == "both"))                  | length),
+        codex_only:            ($f | map(select(.agreement == "codex-only"))            | length),
+        claude_only:           ($f | map(select(.agreement == "claude-only"))           | length),
+        deterministic:         ($f | map(select(.agreement == "deterministic"))         | length),
+        unconfirmed_by_codex:  ($f | map(select(.agreement == "unconfirmed-by-codex"))  | length),
+        unconfirmed_by_claude: ($f | map(select(.agreement == "unconfirmed-by-claude")) | length)
+      }
+  ' "$WORK_DIR/codex-output.json" 2>/dev/null || echo '{"both":0,"codex_only":0,"claude_only":0,"deterministic":0,"unconfirmed_by_codex":0,"unconfirmed_by_claude":0}')
+
+  # Delta block: only when iteration mode != initial.
+  local delta_block='null'
+  if [[ "$iteration_mode" != "initial" ]]; then
+    delta_block=$(jq '
+      (.delta // .iteration_meta.delta // null)
+    ' "$WORK_DIR/codex-output.json" 2>/dev/null || echo 'null')
+  fi
 
   jq -n \
     --arg pr_url "$pr_url" \
     --arg pr_number "$pr_number" \
-    --arg verdict "$(jq -r '.overall_correctness' "$WORK_DIR/codex-output.json")" \
+    --arg verdict "$v2_verdict" \
+    --arg verdict_raw "$raw_verdict" \
     --arg confidence "$(jq -r '.overall_confidence_score' "$WORK_DIR/codex-output.json")" \
     --arg explanation "$(jq -r '.overall_explanation' "$WORK_DIR/codex-output.json")" \
     --argjson total "$total_findings" \
     --argjson reported "$filtered_count" \
     --argjson resolved "$resolved_count" \
     --argjson iteration "$review_iteration" \
+    --arg mode "$iteration_mode" \
     --arg threshold "$THRESHOLD" \
     --arg model "$MODEL" \
+    --argjson agreement_summary "$agreement_summary" \
+    --argjson delta "$delta_block" \
     '{
       status: "success",
       pr_url: $pr_url,
@@ -2673,12 +2700,16 @@ main() {
       model: $model,
       threshold: $threshold,
       review_iteration: $iteration,
+      mode: $mode,
       verdict: $verdict,
+      verdict_raw: $verdict_raw,
       overall_confidence: $confidence,
       explanation: $explanation,
       total_findings: $total,
       reported_findings: $reported,
-      resolved_findings: $resolved
+      resolved_findings: $resolved,
+      agreement_summary: $agreement_summary,
+      delta: $delta
     }'
 
   echo "Review posted to $pr_url" >&2

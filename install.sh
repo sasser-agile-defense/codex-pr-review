@@ -8,9 +8,10 @@ SKILL_NAME="codex-pr-review"
 SKILL_DIR="$HOME/.claude/skills/$SKILL_NAME"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# v2 install opt-in (P0..P5). Default stays "1" through P4 baking; flips to
-# "2" at the end of P5 per IMPLEMENTATION_PLAN.md §4.
-INSTALL_VERSION="1"
+# v2 install default (post-P5). Use --version 1 to roll back to the legacy
+# single-Codex pipeline. Per IMPLEMENTATION_PLAN.md §4, v2 becomes the default
+# at the end of P5.
+INSTALL_VERSION="2"
 
 # Parse args (single optional flag for now).
 while [[ $# -gt 0 ]]; do
@@ -23,9 +24,13 @@ while [[ $# -gt 0 ]]; do
             cat <<EOF
 Usage: install.sh [--version 1|2]
 
-  --version 1   v1 install (default during transition).
-  --version 2   v2 install: also copies plan.js, ast-chunk.sh, grammars/,
-                .codex-pr-review.toml.example; checks for node>=18 and claude.
+  --version 2   v2 install (DEFAULT): dual-family Codex + Claude pipeline,
+                cross-family verifier, deterministic floor, AST-aware chunker,
+                iteration modes, location validator. Requires node>=18 and the
+                claude CLI. Copies plan.js, ast-chunk.sh, grammars/,
+                location-validator.sh, det-floor.sh, claude-* prompts,
+                verifier-* prompts, and .codex-pr-review.toml.example.
+  --version 1   v1 rollback: legacy single-Codex pipeline.
 EOF
             exit 0
             ;;
@@ -92,9 +97,18 @@ cp "$SCRIPT_DIR/scripts/codex-verification-prompt.md" "$SKILL_DIR/scripts/"
 cp "$SCRIPT_DIR/scripts/codex-followup-context.md" "$SKILL_DIR/scripts/"
 
 if [ "$INSTALL_VERSION" = "2" ]; then
-    echo "Installing v2 helpers (plan.js, ast-chunk.sh, grammars/)..."
+    echo "Installing v2 helpers (plan.js, ast-chunk.sh, grammars/, det-floor.sh, location-validator.sh, claude-* / verifier-* prompts)..."
     cp "$SCRIPT_DIR/scripts/plan.js" "$SKILL_DIR/scripts/"
     cp "$SCRIPT_DIR/scripts/ast-chunk.sh" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/det-floor.sh" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/det-output-schema.json" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/location-validator.sh" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/claude-chunk-prompt.md" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/claude-prompt.md" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/claude-followup-context.md" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/verifier-codex-prompt.md" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/verifier-claude-prompt.md" "$SKILL_DIR/scripts/"
+    cp "$SCRIPT_DIR/scripts/verifier-output-schema.json" "$SKILL_DIR/scripts/"
     if [ -f "$SCRIPT_DIR/scripts/package.json" ]; then
         cp "$SCRIPT_DIR/scripts/package.json" "$SKILL_DIR/scripts/"
     fi
@@ -105,6 +119,8 @@ if [ "$INSTALL_VERSION" = "2" ]; then
         cp "$SCRIPT_DIR/.codex-pr-review.toml.example" "$SKILL_DIR/"
     fi
     chmod +x "$SKILL_DIR/scripts/ast-chunk.sh" 2>/dev/null || true
+    chmod +x "$SKILL_DIR/scripts/det-floor.sh" 2>/dev/null || true
+    chmod +x "$SKILL_DIR/scripts/location-validator.sh" 2>/dev/null || true
 fi
 
 # Make scripts executable

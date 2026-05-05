@@ -1,0 +1,19 @@
+# .codex-pr-review.toml — project-level configuration for the codex-pr-review skill.
+#
+# This file is OPTIONAL. v2 P3 will start reading it for the deterministic
+# floor (lint + typecheck + tests). Until P3 lands, the file is documented
+# but not parsed — leave it commented out, or omit it entirely.
+#
+# Drop this file at your repo root as `.codex-pr-review.toml` (no `.example`).
+
+# ─── Deterministic floor (P3) ────────────────────────────────────────────────
+# Each command is run with cwd at the repo root. Output is parsed for
+# (file, line, message) tuples and converted into [deterministic] findings.
+# If a command is omitted, that tool is skipped silently.
+#
+# [deterministic]
+# lint = "ruff check"
+# typecheck = "mypy --strict"
+# tests = "pytest -x --tb=short"
+# # If true, append the diff's file paths to the test command (per-file mode).
+# test_files_only = true

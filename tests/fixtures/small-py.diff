@@ -1,0 +1,48 @@
+diff --git a/foo/handlers.py b/foo/handlers.py
+index e69de29..b1ce19f 100644
+--- a/foo/handlers.py
++++ b/foo/handlers.py
+@@ -0,0 +1,22 @@
++"""Request handlers."""
++
++from typing import Optional
++
++
++def parse_options(payload: dict) -> Optional[dict]:
++    """Extract option flags from a payload.
++
++    The caller (foo.router.dispatch) ensures the payload is a dict.
++    """
++    if not payload:
++        return None
++    opts = {}
++    for k in ("debug", "verbose", "trace"):
++        if k in payload:
++            opts[k] = bool(payload[k])
++    return opts
++
++
++def render_response(opts: Optional[dict]) -> str:
++    return "ok" if opts is None else f"ok ({len(opts)})"
+diff --git a/foo/router.py b/foo/router.py
+index e69de29..52d5cb9 100644
+--- a/foo/router.py
++++ b/foo/router.py
+@@ -0,0 +1,18 @@
++"""HTTP router."""
++
++from foo.handlers import parse_options, render_response
++
++
++def dispatch(request: dict) -> str:
++    """Dispatch a request to the appropriate handler.
++
++    Calls parse_options() defined in foo/handlers.py.
++    """
++    payload = request.get("payload", {})
++    if not isinstance(payload, dict):
++        return "bad request"
++    opts = parse_options(payload)
++    body = render_response(opts)
++    return body
++

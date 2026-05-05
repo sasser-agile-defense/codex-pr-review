@@ -18,6 +18,8 @@ BEGIN {
     in_hunk = 0
     hunk_buf = ""
     hunk_line_count = 0
+    hunk_header = ""
+    needs_hunk_header = 0
 }
 
 # Detect file boundary: "diff --git a/... b/..."
@@ -60,10 +62,13 @@ BEGIN {
         needs_file_header = 1
     }
 
-    # Start new hunk
+    # Start new hunk: the @@ line itself is in hunk_buf, so any pending
+    # mid-hunk-split header re-emission is no longer needed.
     in_hunk = 1
+    hunk_header = $0
     hunk_buf = $0 "\n"
     hunk_line_count = 1
+    needs_hunk_header = 0
     next
 }
 
@@ -85,7 +90,14 @@ BEGIN {
             if (is_context_line || total >= chunk_size * 1.5) {
                 flush_hunk()
                 close_chunk()
-                in_hunk = 1  # still inside the same logical hunk
+                # Still mid-hunk in the *new* chunk: the next chunk file must
+                # begin with the @@ hunk header so the LLM has line context.
+                # Re-enter "in_hunk" and arm header re-emission for the next
+                # accumulation.
+                in_hunk = 1
+                hunk_buf = ""
+                hunk_line_count = 0
+                needs_hunk_header = 1
             }
         }
     } else if (file_header != "") {
@@ -99,6 +111,15 @@ function flush_hunk() {
 
     # Ensure file header is written before hunk content
     ensure_file_header()
+
+    # If we landed in a fresh chunk while still inside a logical hunk, the
+    # buffer for this chunk has not yet had a @@ header emitted. Re-emit the
+    # saved hunk_header so the LLM sees correct line numbers.
+    if (needs_hunk_header && hunk_header != "") {
+        printf "%s\n", hunk_header >> chunk_file()
+        chunk_lines += 1
+        needs_hunk_header = 0
+    }
 
     printf "%s", hunk_buf >> chunk_file()
     chunk_lines += hunk_line_count
@@ -132,6 +153,8 @@ function close_chunk() {
     chunk_lines = 0
     header_written = 0
     needs_file_header = 1
+    # needs_hunk_header is set by callers that close mid-hunk; do not blanket
+    # clear here because the mid-hunk-split path needs it to remain true.
 }
 
 END {

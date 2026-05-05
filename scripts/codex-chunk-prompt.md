@@ -32,6 +32,12 @@ Focus on issues that impact:
 
 You have read-only access to the repository checkout via the sandbox. Use it. When a finding would require knowing the content of a file not shown in the diff (imports, type definitions, call sites, tests), read the file before deciding whether to flag. Do not speculate based on file or symbol names alone.
 
+## Review-only Rules
+
+These rules take precedence over project-wide rules for code review decisions. They describe what to flag, what to ignore, and how to weight findings.
+
+{{REVIEW_RULES}}
+
 {{PROJECT_RULES}}
 
 {{PRIOR_REVIEW}}
@@ -41,6 +47,12 @@ You have read-only access to the repository checkout via the sandbox. Use it. Wh
 The PR touches more code than this chunk shows. The following manifest lists every file changed and every symbol added across the full PR. If a symbol referenced in this chunk appears in the manifest but isn't defined in this chunk, **assume it is defined in another chunk — do not flag it as undefined.**
 
 {{MANIFEST}}
+
+## Cross-chunk Symbol Neighbors
+
+The following symbols are referenced in this chunk but defined in other chunks of this PR. Do not flag them as undefined or missing. Treat each as correctly defined elsewhere.
+
+{{NEIGHBORS}}
 
 ## Pull Request Information
 

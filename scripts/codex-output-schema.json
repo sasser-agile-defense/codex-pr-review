@@ -45,6 +45,21 @@
             "type": "string",
             "enum": ["new", "persisting"],
             "description": "Whether this is a new finding or one persisting from a prior review. Use 'new' for initial reviews."
+          },
+          "source": {
+            "type": "string",
+            "enum": ["codex", "claude", "deterministic"],
+            "description": "v2: which reviewer produced this finding. Optional; absent in v1 outputs."
+          },
+          "verifier_verdict": {
+            "type": "string",
+            "enum": ["confirmed", "refuted", "inconclusive", "n/a"],
+            "description": "v2: cross-family verifier verdict on this finding. Optional; absent in v1 outputs."
+          },
+          "agreement": {
+            "type": "string",
+            "enum": ["both", "codex-only", "claude-only", "deterministic", "unconfirmed-by-codex", "unconfirmed-by-claude"],
+            "description": "v2: agreement / confidence label rendered alongside the finding. Optional; absent in v1 outputs."
           }
         },
         "required": ["title", "body", "confidence_score", "priority", "code_location", "status"],
@@ -74,6 +89,38 @@
         "type": "string"
       },
       "description": "Titles of prior review findings that have been resolved. Empty array for initial reviews."
+    },
+    "iteration_meta": {
+      "type": "object",
+      "description": "v2: metadata about the iteration (mode, prior_sha, delta block). Optional; absent in v1 outputs.",
+      "properties": {
+        "iteration": {
+          "type": "integer",
+          "description": "1-based iteration counter (matches review_iteration)."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["initial", "followup-after-fixes", "delta-since-prior"],
+          "description": "Iteration classification. See SPEC_V2.md §4.1."
+        },
+        "prior_sha": {
+          "type": "string",
+          "description": "SHA of the head commit at the prior review, if known."
+        },
+        "delta": {
+          "type": "object",
+          "properties": {
+            "resolved": {"type": "array", "items": {"type": "string"}},
+            "persisting": {"type": "array", "items": {"type": "string"}},
+            "new": {"type": "array", "items": {"type": "string"}},
+            "regressed": {"type": "array", "items": {"type": "string"}}
+          },
+          "required": ["resolved", "persisting", "new", "regressed"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["iteration", "mode"],
+      "additionalProperties": false
     }
   },
   "required": ["findings", "overall_correctness", "overall_explanation", "overall_confidence_score", "review_iteration", "resolved_prior_findings"],

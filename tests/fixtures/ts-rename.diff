@@ -1,0 +1,36 @@
+diff --git a/src/auth.ts b/src/auth.ts
+index 1234567..abcdef0 100644
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1,15 +1,15 @@
+ import { User } from "./types";
+
+-export function authenticateUser(token: string): User | null {
++export function authenticateUserV2(token: string): User | null {
+   if (!token) return null;
+   const decoded = decodeJwt(token);
+   if (!decoded) return null;
+   return { id: decoded.sub, email: decoded.email };
+ }
+
+ export function decodeJwt(token: string): any {
+-  // pre-existing helper
++  // pre-existing helper, signature unchanged
+   const parts = token.split(".");
+   return parts.length === 3 ? JSON.parse(atob(parts[1])) : null;
+ }
+diff --git a/src/server.ts b/src/server.ts
+index 9876543..fedcba9 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -1,8 +1,8 @@
+-import { authenticateUser } from "./auth";
++import { authenticateUserV2 } from "./auth";
+
+ export function handleRequest(req: { headers: Record<string, string> }) {
+   const token = req.headers["authorization"]?.replace("Bearer ", "");
+-  const user = authenticateUser(token ?? "");
++  const user = authenticateUserV2(token ?? "");
+   if (!user) return { status: 401 };
+   return { status: 200, user };
+ }

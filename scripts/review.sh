@@ -125,6 +125,9 @@ MODEL_CLAUDE="claude-opus-4-7"
 # v2 additions (P2):
 MODEL_VERIFIER="claude-haiku-4-5"   # default cross-family verifier model
 
+# v2 additions (P4):
+MODE="auto"   # auto | initial | followup | delta — iteration mode override
+
 # ─── Arg Parsing ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -178,6 +181,13 @@ while [[ $# -gt 0 ]]; do
       VERIFY_ENABLED="false"
       shift
       ;;
+    --mode)
+      case "$2" in
+        auto|initial|followup|delta) MODE="$2" ;;
+        *) echo "Error: --mode must be auto|initial|followup|delta, got: $2" >&2; exit 1 ;;
+      esac
+      shift 2
+      ;;
     -h|--help)
       cat >&2 <<'USAGE'
 Usage: review.sh [PR_NUMBER|PR_URL] [options]
@@ -194,6 +204,7 @@ Options:
   --chunk-size N         Lines per chunk (default 3000)
   --max-parallel N       Concurrent slots during chunked review (default 4; each slot runs Codex+Claude in parallel)
   --no-verify            Skip the cross-family verifier (debug only)
+  --mode MODE            auto | initial | followup | delta (default auto)
   -h, --help             Show this help and exit
 USAGE
       exit 0
@@ -329,7 +340,7 @@ gather_project_rules() {
   echo "$rules"
 }
 
-# ─── Prior Review Detection ─────────────────────────────────────────────────
+# ─── Prior Review Detection (v1, retained for back-compat) ──────────────────
 gather_prior_review() {
   local pr_number="$1"
   local repo
@@ -365,6 +376,273 @@ gather_prior_review() {
   fi
 
   return 1
+}
+
+# ─── Prior Review Detection (v2 P4) ─────────────────────────────────────────
+# Parses a PR comment body for the v2 sentinel first; falls back to the v1
+# CODEX_REVIEW_DATA_START block on absence. Writes a structured object to
+# stdout:
+#   {found: bool, prior_sha: str, iteration: int, verdict: str, findings: [...]}
+# When called with two args, the first arg is treated as a path to a fixture
+# file and the second is the (unused) PR number. With one arg, it's the PR
+# number and gh is queried for the latest comment with either sentinel.
+_parse_v2_sentinel() {
+  # Parses a single line like:
+  #   <!-- codex-pr-review:meta v=2 sha=abc123 iteration=2 findings=3 verdict=needs-changes mode=delta-since-prior prior_sha=deadbeef -->
+  # Outputs a JSON object via jq -n (no shell interpolation hazards).
+  local line="$1"
+  # Use a perl one-liner to extract k=v pairs; tolerate any order and unknown
+  # extra keys.
+  printf '%s' "$line" | perl -ne '
+    my %kv;
+    while (/\b([A-Za-z_][A-Za-z0-9_]*)=([^\s>]+)/g) { $kv{$1} = $2; }
+    my $sha       = $kv{sha}       // "";
+    my $iter      = $kv{iteration} // 1;
+    my $findings  = $kv{findings}  // 0;
+    my $verdict   = $kv{verdict}   // "";
+    my $mode      = $kv{mode}      // "";
+    my $prior_sha = $kv{prior_sha} // "";
+    print qq({"sha":"$sha","iteration":$iter,"findings_count":$findings,"verdict":"$verdict","mode":"$mode","prior_sha_inner":"$prior_sha"});
+  '
+}
+
+# Reads a PR comment body (stdin) and emits the parsed prior-review JSON to
+# stdout. Used by both the live (gh) path and the test fixture path.
+_extract_prior_review_from_body() {
+  local body
+  body=$(cat)
+
+  # 1. v2 sentinel.
+  local sentinel_line
+  sentinel_line=$(printf '%s\n' "$body" | grep -m1 -- '<!-- codex-pr-review:meta v=2 ' || true)
+  if [[ -n "$sentinel_line" ]]; then
+    local meta_obj
+    meta_obj=$(_parse_v2_sentinel "$sentinel_line")
+
+    # The v1 data block (if also present) gives us the embedded findings.
+    local data_block
+    data_block=$(printf '%s\n' "$body" | sed -n '/CODEX_REVIEW_DATA_START/,/CODEX_REVIEW_DATA_END/{//d;p;}')
+
+    local findings_arr='[]'
+    if [[ -n "$data_block" ]] && printf '%s' "$data_block" | jq empty 2>/dev/null; then
+      findings_arr=$(printf '%s' "$data_block" | jq -c '.output.findings // []' 2>/dev/null || echo '[]')
+    fi
+
+    jq -n --argjson meta "$meta_obj" --argjson findings "$findings_arr" '
+      {
+        found: true,
+        prior_sha: ($meta.sha // ""),
+        iteration: ($meta.iteration // 1),
+        verdict: ($meta.verdict // ""),
+        findings: $findings,
+        raw_data: null
+      }
+    '
+    return 0
+  fi
+
+  # 2. v1 fallback: CODEX_REVIEW_DATA_START block. No prior_sha is recorded.
+  local data_block
+  data_block=$(printf '%s\n' "$body" | sed -n '/CODEX_REVIEW_DATA_START/,/CODEX_REVIEW_DATA_END/{//d;p;}')
+  if [[ -n "$data_block" ]] && printf '%s' "$data_block" | jq empty 2>/dev/null; then
+    printf '%s' "$data_block" | jq -c '
+      {
+        found: true,
+        prior_sha: "",
+        iteration: (.review_iteration // 1),
+        verdict: (.output.overall_correctness // ""),
+        findings: (.output.findings // []),
+        raw_data: .
+      }
+    '
+    return 0
+  fi
+
+  # 3. Nothing found.
+  printf '{"found":false,"prior_sha":"","iteration":0,"verdict":"","findings":[],"raw_data":null}\n'
+  return 0
+}
+
+gather_prior_review_v2() {
+  local pr_number="$1"
+  local fixture_file="${2:-}"   # optional: path to a PR comment fixture (used by tests)
+
+  local out_file="${WORK_DIR:-/tmp}/prior-review.json"
+
+  if [[ -n "$fixture_file" ]]; then
+    if [[ ! -f "$fixture_file" ]]; then
+      echo "Error: gather_prior_review_v2: fixture file not found: $fixture_file" >&2
+      printf '{"found":false,"prior_sha":"","iteration":0,"verdict":"","findings":[],"raw_data":null}\n' > "$out_file"
+      cat "$out_file"
+      return 1
+    fi
+    _extract_prior_review_from_body < "$fixture_file" > "$out_file"
+    cat "$out_file"
+    if jq -e '.found' "$out_file" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  fi
+
+  # Live path: query gh for latest review comment bodies.
+  local repo
+  repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || {
+    printf '{"found":false,"prior_sha":"","iteration":0,"verdict":"","findings":[],"raw_data":null}\n' > "$out_file"
+    cat "$out_file"
+    return 1
+  }
+
+  # Pull comment bodies that contain either sentinel; v2 sentinel is preferred.
+  local encoded_bodies
+  encoded_bodies=$(gh api "repos/$repo/issues/$pr_number/comments" \
+    --paginate \
+    --jq '.[] | select((.body | contains("codex-pr-review:meta v=2")) or (.body | contains("CODEX_REVIEW_DATA_START"))) | .body | @base64' 2>/dev/null)
+
+  if [[ -z "$encoded_bodies" ]]; then
+    printf '{"found":false,"prior_sha":"","iteration":0,"verdict":"","findings":[],"raw_data":null}\n' > "$out_file"
+    cat "$out_file"
+    return 1
+  fi
+
+  # Use the most recent comment.
+  local last_encoded
+  last_encoded=$(echo "$encoded_bodies" | tail -1)
+  local comment_body
+  comment_body=$(printf '%s' "$last_encoded" | jq -Rr '@base64d')
+
+  if [[ -z "$comment_body" ]]; then
+    printf '{"found":false,"prior_sha":"","iteration":0,"verdict":"","findings":[],"raw_data":null}\n' > "$out_file"
+    cat "$out_file"
+    return 1
+  fi
+
+  printf '%s\n' "$comment_body" | _extract_prior_review_from_body > "$out_file"
+  cat "$out_file"
+  if jq -e '.found' "$out_file" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# ─── Iteration Classifier (v2 P4) ───────────────────────────────────────────
+# Inputs:
+#   prior_sha — v2 prior-review SHA (may be empty for v1 priors / no prior).
+#   prior_found — "true" if a prior review was located.
+#   mode — auto | initial | followup | delta (forced override).
+# Output (stdout): one of `initial` / `followup-after-fixes` /
+# `delta-since-prior`. The `delta-since-prior` mode is only emitted when
+# prior_sha is set and recent commits look non-fix-flavored.
+classify_iteration() {
+  local prior_sha="$1"
+  local prior_found="$2"   # "true" / "false"
+  local mode="${3:-auto}"
+
+  case "$mode" in
+    initial)  echo "initial"; return 0 ;;
+    followup) echo "followup-after-fixes"; return 0 ;;
+    delta)
+      if [[ "$prior_found" != "true" ]]; then
+        echo "Error: --mode delta requires a prior review, but none was found." >&2
+        return 2
+      fi
+      echo "delta-since-prior"
+      return 0
+      ;;
+    auto) ;;
+    *) echo "Error: classify_iteration: bad mode '$mode'" >&2; return 2 ;;
+  esac
+
+  # auto mode.
+  if [[ "$prior_found" != "true" ]]; then
+    echo "initial"
+    return 0
+  fi
+
+  if [[ -z "$prior_sha" ]]; then
+    # v1 prior review, no SHA on record. Best-effort fallback.
+    echo "followup-after-fixes"
+    return 0
+  fi
+
+  # Allow tests to mock `git log` output by setting ITERATION_GIT_LOG_OVERRIDE.
+  # The override is honored even when empty (treated as "no commits since
+  # prior_sha"), distinguished from "unset" via ${var+set}.
+  local git_log_output git_log_rc=0
+  if [[ -n "${ITERATION_GIT_LOG_OVERRIDE+set}" ]]; then
+    git_log_output="$ITERATION_GIT_LOG_OVERRIDE"
+  else
+    git_log_output=$(git log --oneline "${prior_sha}..HEAD" 2>/dev/null) || git_log_rc=$?
+    if [[ "$git_log_rc" -ne 0 ]]; then
+      echo "Warning: git log ${prior_sha}..HEAD failed (SHA not in local clone). Falling back to followup-after-fixes." >&2
+      echo "  Recover full history with: git fetch --unshallow --recurse-submodules" >&2
+      echo "followup-after-fixes"
+      return 0
+    fi
+  fi
+
+  if [[ -z "$git_log_output" ]]; then
+    echo "followup-after-fixes"
+    return 0
+  fi
+
+  # Count commits and how many look fix-flavored.
+  local total_commits=0 fix_commits=0
+  # Build regexes outside the conditional so bash 3.2 (macOS default) doesn't
+  # choke on `$` inside the [[ =~ ]] expression.
+  local re_fix='^[Ff]ix([[:space:]:(]|$)'
+  local re_chore='^[Cc]hore([[:space:]:(]|$)'
+  local re_address='^[Aa]ddress([[:space:]:(]|$)'
+  local re_pr_feedback='[Pp][Rr][[:space:]]+[Ff]eedback'
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    total_commits=$((total_commits + 1))
+    # The first column is the abbreviated SHA; the rest is the message.
+    local msg="${line#* }"
+    if [[ "$msg" =~ $re_fix ]] || \
+       [[ "$msg" =~ $re_chore ]] || \
+       [[ "$msg" =~ $re_address ]] || \
+       [[ "$msg" =~ $re_pr_feedback ]]; then
+      fix_commits=$((fix_commits + 1))
+    fi
+  done <<< "$git_log_output"
+
+  if [[ "$total_commits" -gt 0 && "$fix_commits" -eq "$total_commits" ]]; then
+    echo "followup-after-fixes"
+  else
+    echo "delta-since-prior"
+  fi
+  return 0
+}
+
+# ─── Compute delta diff for delta-since-prior mode ──────────────────────────
+# Writes git diff $prior_sha..HEAD to $WORK_DIR/delta-diff.txt. On failure
+# (SHA not in local clone), emits a warning that includes the exact recovery
+# command and returns non-zero so the caller can fall back to the full diff.
+compute_delta_diff() {
+  local prior_sha="$1"
+  local out_file="$2"
+
+  if [[ -z "$prior_sha" ]]; then
+    echo "Error: compute_delta_diff: prior_sha is empty" >&2
+    return 1
+  fi
+
+  # Allow tests to mock the diff output. Honor empty overrides (the test may
+  # set the variable to an empty string to simulate "no commits"), checking
+  # ${var+set} rather than -n.
+  if [[ -n "${ITERATION_GIT_DIFF_OVERRIDE+set}" ]]; then
+    printf '%s' "$ITERATION_GIT_DIFF_OVERRIDE" > "$out_file"
+    return 0
+  fi
+
+  if ! git diff "${prior_sha}..HEAD" > "$out_file" 2>/dev/null; then
+    echo "Warning: git diff ${prior_sha}..HEAD failed (SHA not present in local clone)." >&2
+    echo "  Falling back to full PR diff. To recover full history, run:" >&2
+    echo "    git fetch --unshallow --recurse-submodules" >&2
+    rm -f "$out_file"
+    return 1
+  fi
+  return 0
 }
 
 # ─── Build Manifest (v1 fallback) ───────────────────────────────────────────
@@ -464,7 +742,7 @@ read_plan_neighbors() {
   ' "$plan_file" 2>/dev/null
 }
 
-# ─── Build Follow-up Context ────────────────────────────────────────────────
+# ─── Build Follow-up Context (v1, retained for back-compat) ────────────────
 build_followup_context() {
   local prior_review_json="$1"
   local review_iteration="$2"
@@ -473,18 +751,148 @@ build_followup_context() {
   template=$(cat "$SCRIPT_DIR/codex-followup-context.md")
 
   local prior_verdict prior_confidence prior_explanation prior_findings
-  prior_verdict=$(echo "$prior_review_json" | jq -r '.output.overall_correctness')
-  prior_confidence=$(echo "$prior_review_json" | jq -r '.output.overall_confidence_score')
-  prior_explanation=$(echo "$prior_review_json" | jq -r '.output.overall_explanation')
-  prior_findings=$(echo "$prior_review_json" | jq -c '.output.findings')
+  prior_verdict=$(echo "$prior_review_json" | jq -r '.output.overall_correctness // ""')
+  prior_confidence=$(echo "$prior_review_json" | jq -r '.output.overall_confidence_score // 0')
+  prior_explanation=$(echo "$prior_review_json" | jq -r '.output.overall_explanation // ""')
+  prior_findings=$(echo "$prior_review_json" | jq -c '.output.findings // []')
 
   template="${template//\{\{REVIEW_ITERATION\}\}/$review_iteration}"
+  template="${template//\{\{ITERATION_MODE\}\}/followup-after-fixes}"
   template="${template//\{\{PRIOR_VERDICT\}\}/$prior_verdict}"
   template="${template//\{\{PRIOR_CONFIDENCE\}\}/$prior_confidence}"
   template="${template//\{\{PRIOR_EXPLANATION\}\}/$prior_explanation}"
   template="${template//\{\{PRIOR_FINDINGS\}\}/$prior_findings}"
+  template="${template//\{\{PRIOR_SHA\}\}/}"
+  template="${template//\{\{DELTA_BLOCK\}\}/}"
 
   echo "$template"
+}
+
+# ─── Build Follow-up Context (v2 P4) ────────────────────────────────────────
+# Renders the codex-followup-context.md (or claude-followup-context.md)
+# template using v2 placeholders. The prior_review JSON is the structured
+# object produced by gather_prior_review_v2 (or the v1 wrapped form when
+# called from the v1 back-compat path; see arg conventions below).
+#
+# Args:
+#   1. family            — codex | claude (selects the template file).
+#   2. prior_review_json — gather_prior_review_v2 output (or "" for none).
+#   3. review_iteration  — current iteration number (1-based).
+#   4. iteration_mode    — initial | followup-after-fixes | delta-since-prior.
+#   5. prior_sha         — v2 prior SHA (may be empty).
+#   6. delta_summary     — pre-rendered delta markdown (may be empty).
+build_followup_context_v2() {
+  local family="$1"
+  local prior_review_json="$2"
+  local review_iteration="$3"
+  local iteration_mode="$4"
+  local prior_sha="$5"
+  local delta_summary="${6:-}"
+
+  if [[ "$iteration_mode" == "initial" ]]; then
+    # No follow-up section in initial mode.
+    echo ""
+    return 0
+  fi
+
+  local template_file
+  case "$family" in
+    codex)  template_file="$SCRIPT_DIR/codex-followup-context.md" ;;
+    claude) template_file="$SCRIPT_DIR/claude-followup-context.md" ;;
+    *)
+      echo "Error: build_followup_context_v2: unknown family '$family'" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -f "$template_file" ]]; then
+    # Best-effort: fall back to the codex template.
+    template_file="$SCRIPT_DIR/codex-followup-context.md"
+  fi
+
+  local template
+  template=$(cat "$template_file")
+
+  local prior_verdict="" prior_confidence="0" prior_explanation="" prior_findings="[]"
+  if [[ -n "$prior_review_json" ]] && printf '%s' "$prior_review_json" | jq empty 2>/dev/null; then
+    # Tolerate both shapes:
+    #   - gather_prior_review_v2 output: {found, prior_sha, iteration, verdict, findings, raw_data}
+    #   - v1 raw embed: {output: {overall_correctness, overall_confidence_score, ...}}
+    if printf '%s' "$prior_review_json" | jq -e '.raw_data.output' >/dev/null 2>&1; then
+      prior_verdict=$(printf '%s' "$prior_review_json" | jq -r '.raw_data.output.overall_correctness // ""')
+      prior_confidence=$(printf '%s' "$prior_review_json" | jq -r '.raw_data.output.overall_confidence_score // 0')
+      prior_explanation=$(printf '%s' "$prior_review_json" | jq -r '.raw_data.output.overall_explanation // ""')
+      prior_findings=$(printf '%s' "$prior_review_json" | jq -c '.raw_data.output.findings // .findings // []')
+    elif printf '%s' "$prior_review_json" | jq -e '.output' >/dev/null 2>&1; then
+      prior_verdict=$(printf '%s' "$prior_review_json" | jq -r '.output.overall_correctness // ""')
+      prior_confidence=$(printf '%s' "$prior_review_json" | jq -r '.output.overall_confidence_score // 0')
+      prior_explanation=$(printf '%s' "$prior_review_json" | jq -r '.output.overall_explanation // ""')
+      prior_findings=$(printf '%s' "$prior_review_json" | jq -c '.output.findings // []')
+    else
+      prior_verdict=$(printf '%s' "$prior_review_json" | jq -r '.verdict // ""')
+      prior_findings=$(printf '%s' "$prior_review_json" | jq -c '.findings // []')
+    fi
+  fi
+
+  local delta_block_section=""
+  if [[ "$iteration_mode" == "delta-since-prior" ]]; then
+    delta_block_section="You are reviewing only the commits since the last review (SHA \`${prior_sha}\`). The following prior findings are carried forward — assess whether each is resolved in the delta or still present."$'\n\n'
+    if [[ -n "$delta_summary" ]]; then
+      delta_block_section+="${delta_summary}"$'\n\n'
+    fi
+  fi
+
+  # Substitute placeholders. We use perl for multi-line-safe substitution of
+  # the JSON-shaped placeholders.
+  REVIEW_ITERATION_VAL="$review_iteration" \
+  ITERATION_MODE_VAL="$iteration_mode" \
+  PRIOR_VERDICT_VAL="$prior_verdict" \
+  PRIOR_CONFIDENCE_VAL="$prior_confidence" \
+  PRIOR_EXPLANATION_VAL="$prior_explanation" \
+  PRIOR_FINDINGS_VAL="$prior_findings" \
+  PRIOR_SHA_VAL="$prior_sha" \
+  DELTA_BLOCK_VAL="$delta_block_section" \
+  perl -pe '
+    BEGIN {
+      $ri  = $ENV{REVIEW_ITERATION_VAL};
+      $im  = $ENV{ITERATION_MODE_VAL};
+      $pv  = $ENV{PRIOR_VERDICT_VAL};
+      $pc  = $ENV{PRIOR_CONFIDENCE_VAL};
+      $pe  = $ENV{PRIOR_EXPLANATION_VAL};
+      $pf  = $ENV{PRIOR_FINDINGS_VAL};
+      $ps  = $ENV{PRIOR_SHA_VAL};
+      $db  = $ENV{DELTA_BLOCK_VAL};
+    }
+    s/\Q{{REVIEW_ITERATION}}\E/$ri/g;
+    s/\Q{{ITERATION_MODE}}\E/$im/g;
+    s/\Q{{PRIOR_VERDICT}}\E/$pv/g;
+    s/\Q{{PRIOR_CONFIDENCE}}\E/$pc/g;
+    s/\Q{{PRIOR_EXPLANATION}}\E/$pe/g;
+    s/\Q{{PRIOR_FINDINGS}}\E/$pf/g;
+    s/\Q{{PRIOR_SHA}}\E/$ps/g;
+    s/\Q{{DELTA_BLOCK}}\E/$db/g;
+  ' <<< "$template"
+}
+
+# Render a markdown bullet list of prior findings for use in the delta block.
+# Each finding renders as `[priority]` plus location, suitable for splicing
+# into build_followup_context_v2's delta_summary arg.
+render_prior_findings_summary() {
+  local prior_review_json="$1"
+  if [[ -z "$prior_review_json" ]]; then
+    echo "_No prior findings._"
+    return 0
+  fi
+  printf '%s' "$prior_review_json" | jq -r '
+    (.findings // (.raw_data.output.findings // [])) as $fs
+    | if ($fs | length) == 0 then
+        "_No prior findings._"
+      else
+        ($fs | map(
+          "- [P\(.priority // 0)] `\(.code_location.path // "?"):\(.code_location.start_line // 0)` — \(.title // "(no title)") `[persisting]`"
+        ) | join("\n"))
+      end
+  ' 2>/dev/null || echo "_No prior findings._"
 }
 
 # ─── Build Prompt (file-based to avoid bash O(n*m) substitution on large diffs)
@@ -1650,26 +2058,58 @@ format_comment() {
     verdict_emoji="❌"
   fi
 
+  # ── Iteration metadata (v2 P4) ───────────────────────────────────────────
+  # Read iteration-meta.json (written by main()) and the synthesis output's
+  # `delta` block (if present) to drive the mode-aware header and the
+  # Resolved/Persisting sections.
+  local iter_meta_file="$WORK_DIR/iteration-meta.json"
+  local iter_mode="initial" iter_prior_sha=""
+  if [[ -f "$iter_meta_file" ]] && jq empty "$iter_meta_file" 2>/dev/null; then
+    iter_mode=$(jq -r '.mode // "initial"' "$iter_meta_file")
+    iter_prior_sha=$(jq -r '.prior_sha // ""' "$iter_meta_file")
+  fi
+
+  local iter_label_human="initial"
+  case "$iter_mode" in
+    initial)               iter_label_human="initial" ;;
+    followup-after-fixes)  iter_label_human="follow-up" ;;
+    delta-since-prior)     iter_label_human="delta" ;;
+    *)                     iter_label_human="$iter_mode" ;;
+  esac
+
   # Build comment header
   local comment=""
   if [[ "$review_iteration" -gt 1 ]]; then
-    comment+="### Codex PR Review ($MODEL) — Follow-up #$review_iteration"$'\n\n'
+    comment+="## Codex PR Review v2 — Iteration $review_iteration ($iter_label_human)"$'\n\n'
   else
-    comment+="### Codex PR Review ($MODEL)"$'\n\n'
+    comment+="## Codex PR Review v2 — Iteration $review_iteration ($iter_label_human)"$'\n\n'
   fi
   comment+="**Verdict:** $verdict_emoji $verdict (confidence: $confidence_score)"$'\n\n'
   comment+="**Summary:** $explanation"$'\n\n'
   comment+="---"$'\n\n'
 
-  # Show resolved prior findings for follow-up reviews
-  if [[ "$review_iteration" -gt 1 ]]; then
+  # ── Resolved-since-last-review section (v2 P4) ───────────────────────────
+  # Source order, in priority:
+  #   1. synthesis output's iteration_meta.delta.resolved (preferred — populated
+  #      by the synthesizer per spec §4.5).
+  #   2. legacy resolved_prior_findings array (v1 carry-over).
+  if [[ "$iter_mode" == "followup-after-fixes" || "$iter_mode" == "delta-since-prior" ]]; then
+    local resolved_titles_file="$WORK_DIR/_resolved_titles.txt"
+    : > "$resolved_titles_file"
+    if jq -e '.iteration_meta.delta.resolved // empty | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -r '.iteration_meta.delta.resolved[]?' "$output_file" >> "$resolved_titles_file" 2>/dev/null || true
+    fi
+    if [[ ! -s "$resolved_titles_file" ]] && jq -e '(.resolved_prior_findings // []) | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -r '.resolved_prior_findings[]?' "$output_file" >> "$resolved_titles_file" 2>/dev/null || true
+    fi
     local resolved_count
-    resolved_count=$(jq '[.resolved_prior_findings // [] | length] | .[0]' "$output_file")
+    resolved_count=$(wc -l < "$resolved_titles_file" | tr -d ' ')
     if [[ "$resolved_count" -gt 0 ]]; then
-      comment+="#### Resolved from Prior Review"$'\n\n'
+      comment+="### Resolved since last review ($resolved_count)"$'\n\n'
       while IFS= read -r resolved_title; do
+        [[ -z "$resolved_title" ]] && continue
         comment+="- ~~${resolved_title}~~"$'\n'
-      done < <(jq -r '.resolved_prior_findings[]' "$output_file")
+      done < "$resolved_titles_file"
       comment+=$'\n'
     fi
   fi
@@ -1788,6 +2228,38 @@ format_comment() {
   if [[ "$review_iteration" -gt 1 ]]; then
     iteration_label=" | Follow-up #$review_iteration"
   fi
+
+  # ── Persisting-from-prior-review section (v2 P4, delta-since-prior only) ──
+  if [[ "$iter_mode" == "delta-since-prior" ]]; then
+    local persisting_buf="$WORK_DIR/_persisting_titles.json"
+    : > "$persisting_buf"
+    if jq -e '.iteration_meta.delta.persisting // empty | length > 0' "$output_file" >/dev/null 2>&1; then
+      jq -c '.iteration_meta.delta.persisting[]?' "$output_file" >> "$persisting_buf" 2>/dev/null || true
+    fi
+    local persisting_count
+    persisting_count=$(wc -l < "$persisting_buf" | tr -d ' ')
+    if [[ "$persisting_count" -gt 0 ]]; then
+      comment+=$'\n'"### Persisting from prior review ($persisting_count)"$'\n\n'
+      while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        # Each `entry` may be either a plain string (title) or a finding-shaped
+        # object. We render both shapes for resilience.
+        local rendered
+        rendered=$(printf '%s' "$entry" | jq -r '
+          if type == "string" then
+            "- [persisting] " + .
+          elif type == "object" then
+            "- [persisting] [P\(.priority // 0)] `\(.code_location.path // "?"):\(.code_location.start_line // 0)` — \(.title // "(no title)")"
+          else
+            "- [persisting] " + tostring
+          end
+        ' 2>/dev/null || echo "- [persisting] $entry")
+        comment+="${rendered}"$'\n'
+      done < "$persisting_buf"
+      comment+=$'\n'
+    fi
+  fi
+
   comment+="---"$'\n'
 
   # Warn about incomplete coverage if any chunks failed during chunked review.
@@ -1805,13 +2277,14 @@ format_comment() {
 
   # ── v2 sentinel (compact, machine-parseable; primary in v2) ──────────────
   # P4's iteration classifier reads this first; falls back to the legacy
-  # CODEX_REVIEW_DATA_START block below for v1 back-compat.
+  # CODEX_REVIEW_DATA_START block below for v1 back-compat. Mode and prior_sha
+  # are appended in v2 P4 so the next iteration can compute its own delta.
   local sanitized_verdict="$verdict"
   case "$sanitized_verdict" in
     "patch is correct")    sanitized_verdict="correct" ;;
     "patch is incorrect")  sanitized_verdict="needs-changes" ;;
   esac
-  comment+=$'\n\n'"<!-- codex-pr-review:meta v=2 sha=${head_sha} iteration=${review_iteration} findings=${filtered_count} verdict=${sanitized_verdict} -->"
+  comment+=$'\n\n'"<!-- codex-pr-review:meta v=2 sha=${head_sha} iteration=${review_iteration} findings=${filtered_count} verdict=${sanitized_verdict} mode=${iter_mode} prior_sha=${iter_prior_sha} -->"
 
   # Embed review data for future follow-up reviews (v1 back-compat)
   local embed_json
@@ -1850,17 +2323,39 @@ main() {
   echo "  Branch: $head_branch → $base_branch" >&2
   echo "  Model: $MODEL | Threshold: $THRESHOLD | Chunk size: $CHUNK_SIZE" >&2
 
-  # Check for prior Codex reviews
-  echo "Checking for prior Codex reviews..." >&2
-  local prior_review_json="" review_iteration=1 followup_context=""
-  if prior_review_json=$(gather_prior_review "$pr_number"); then
-    local prior_iteration
-    prior_iteration=$(echo "$prior_review_json" | jq -r '.review_iteration // 1')
+  # ── Prior review detection + iteration classification (v2 P4) ─────────────
+  echo "Checking for prior Codex/Claude reviews..." >&2
+  local review_iteration=1 followup_context=""
+  local prior_review_v2_json="" prior_found="false" prior_sha="" prior_iteration=0
+  local iteration_mode="initial"
+
+  if prior_review_v2_json=$(gather_prior_review_v2 "$pr_number" 2>/dev/null) \
+       && [[ -n "$prior_review_v2_json" ]] \
+       && printf '%s' "$prior_review_v2_json" | jq -e '.found' >/dev/null 2>&1; then
+    prior_found="true"
+    prior_sha=$(printf '%s' "$prior_review_v2_json" | jq -r '.prior_sha // ""')
+    prior_iteration=$(printf '%s' "$prior_review_v2_json" | jq -r '.iteration // 0')
     review_iteration=$((prior_iteration + 1))
-    echo "  Found prior review (iteration $prior_iteration). This will be follow-up review #$review_iteration." >&2
-    followup_context=$(build_followup_context "$prior_review_json" "$review_iteration")
+    echo "  Found prior review (iteration $prior_iteration, prior_sha=${prior_sha:-<none>}). This will be follow-up review #$review_iteration." >&2
   else
-    echo "  No prior Codex reviews found. This will be the initial review." >&2
+    echo "  No prior Codex reviews found." >&2
+  fi
+
+  # Classify the iteration mode honoring --mode override.
+  if ! iteration_mode=$(classify_iteration "$prior_sha" "$prior_found" "$MODE"); then
+    # classify_iteration writes its own error to stderr (e.g., --mode delta
+    # without a prior review); propagate hard fail.
+    exit 2
+  fi
+  echo "  Iteration mode: $iteration_mode" >&2
+
+  # If --mode initial overrides a prior, reset state so we don't load the
+  # prior context into the prompt.
+  if [[ "$iteration_mode" == "initial" ]]; then
+    prior_review_v2_json=""
+    prior_found="false"
+    prior_sha=""
+    review_iteration=1
   fi
 
   # Get current HEAD SHA for embedding
@@ -1883,6 +2378,23 @@ main() {
     exit 2
   fi
 
+  # ── Delta diff for delta-since-prior mode (v2 P4) ─────────────────────────
+  # When the iteration classifier has decided we should review only the
+  # commits since the prior review SHA, swap the diff_file pointer to the
+  # delta diff. On failure (shallow clone), fall back to the full PR diff
+  # AND demote the iteration mode to followup-after-fixes.
+  if [[ "$iteration_mode" == "delta-since-prior" && -n "$prior_sha" ]]; then
+    local delta_diff_file="$WORK_DIR/delta-diff.txt"
+    if compute_delta_diff "$prior_sha" "$delta_diff_file" \
+         && [[ -s "$delta_diff_file" ]]; then
+      echo "  Using delta diff (commits since $prior_sha)." >&2
+      diff_file="$delta_diff_file"
+    else
+      echo "  Falling back to full PR diff and downgrading to followup-after-fixes." >&2
+      iteration_mode="followup-after-fixes"
+    fi
+  fi
+
   # Optional safety valve: truncate only if user explicitly sets --max-diff-lines > 0.
   # Default (0) reviews the full diff — chunking handles arbitrarily large diffs.
   local diff_lines
@@ -1895,6 +2407,43 @@ main() {
     mv "$truncated" "$diff_file"
     diff_lines="$MAX_DIFF_LINES"
   fi
+
+  # Build the v2 follow-up context now that we know the iteration mode and
+  # the (possibly delta-substituted) diff_file. The codex prompt builder picks
+  # this up via {{PRIOR_REVIEW}}; the claude prompt builder uses the same
+  # variable. A single context body is shared across both families to keep
+  # the prior-finding wording consistent.
+  if [[ "$iteration_mode" != "initial" && "$prior_found" == "true" ]]; then
+    local delta_summary=""
+    if [[ "$iteration_mode" == "delta-since-prior" ]]; then
+      delta_summary=$(render_prior_findings_summary "$prior_review_v2_json")
+    fi
+    followup_context=$(build_followup_context_v2 \
+      "codex" \
+      "$prior_review_v2_json" \
+      "$review_iteration" \
+      "$iteration_mode" \
+      "$prior_sha" \
+      "$delta_summary")
+  else
+    followup_context=""
+  fi
+
+  # Persist iteration metadata for synthesis and format_comment.
+  local iteration_meta_file="$WORK_DIR/iteration-meta.json"
+  jq -n \
+    --argjson iteration "$review_iteration" \
+    --arg mode "$iteration_mode" \
+    --arg prior_sha "$prior_sha" \
+    --argjson prior_findings "$(printf '%s' "${prior_review_v2_json:-{}}" | jq -c '.findings // []' 2>/dev/null || echo '[]')" \
+    '{
+      iteration: $iteration,
+      mode: $mode,
+      prior_sha: $prior_sha,
+      prior_findings: $prior_findings
+    }' > "$iteration_meta_file" 2>/dev/null || \
+      printf '{"iteration":%s,"mode":"%s","prior_sha":"%s","prior_findings":[]}\n' \
+        "$review_iteration" "$iteration_mode" "$prior_sha" > "$iteration_meta_file"
 
   # Gather project rules
   echo "Checking for CLAUDE.md..." >&2

@@ -30,6 +30,32 @@ The following JSON array contains the review output from each chunk. In v2 (P2+)
 - Cross-chunk pattern findings should cite specific files and lines from the chunk results.
 - The final output must use the same JSON schema as individual chunk reviews.
 
+## Iteration metadata and delta block (v2 P4)
+
+The prompt may include a `## Prior Review Context` section indicating the
+iteration mode (`initial`, `followup-after-fixes`, or `delta-since-prior`).
+
+- For `initial` mode, omit the `iteration_meta` and `delta` blocks.
+- For `followup-after-fixes`: populate `iteration_meta` with `{iteration, mode:
+  "followup-after-fixes", prior_sha}` and emit a `delta` object inside the
+  output containing `resolved`, `persisting`, `new`, `regressed` arrays of
+  finding titles. `resolved` lists prior findings no longer present in the
+  current diff. `persisting` lists prior findings still present. `new` lists
+  newly-introduced findings (status="new"). `regressed` is reserved for prior
+  findings that were marked resolved in an earlier iteration but have come
+  back; usually empty in `followup-after-fixes`.
+- For `delta-since-prior`: populate `iteration_meta` with `{iteration, mode:
+  "delta-since-prior", prior_sha, delta: {...}}` where the `delta` object has
+  the same shape as above. The diff you see is the *delta diff* (commits since
+  the prior SHA), not the full PR diff. Prior findings are carried forward; for
+  each, decide if it is `resolved` (the delta commits fixed it), `persisting`
+  (the delta did not touch it; still present), or `regressed` (a prior
+  resolution was undone). Findings introduced by the delta commits go in
+  `new`.
+
+This is **additive** to the synthesis instructions above — you must still
+deduplicate, label agreement, and produce the merged finding list.
+
 ## Repository Access
 
 You have read-only access to the repository checkout via the sandbox. Use it. When a finding would require knowing the content of a file not shown in the diff (imports, type definitions, call sites, tests), read the file before deciding whether to flag. Do not speculate based on file or symbol names alone.

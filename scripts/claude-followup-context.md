@@ -2,7 +2,7 @@
 
 **Iteration mode:** {{ITERATION_MODE}}
 
-This is a **follow-up review** (iteration {{REVIEW_ITERATION}}). A previous Codex review was conducted on this PR. The developer has since pushed changes.
+You are Claude. This is a **follow-up review** (iteration {{REVIEW_ITERATION}}). A previous review (running both Codex and Claude in parallel) was conducted on this PR. The developer has since pushed changes.
 
 ### Previous Review Results
 

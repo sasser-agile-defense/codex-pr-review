@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["confirmed", "refuted", "inconclusive"],
+      "description": "Independent assessment of whether the cited issue exists in the actual source code at the cited lines."
+    },
+    "evidence": {
+      "type": "string",
+      "description": "1-2 sentence justification grounded in specific lines of the file content."
+    },
+    "adjusted_confidence": {
+      "type": "number",
+      "description": "Verifier's confidence (0.0-1.0) that its own verdict is correct, independent of the originating finding's confidence."
+    }
+  },
+  "required": ["verdict", "evidence", "adjusted_confidence"],
+  "additionalProperties": false
+}

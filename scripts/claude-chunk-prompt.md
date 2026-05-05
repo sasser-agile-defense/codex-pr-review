@@ -1,6 +1,10 @@
 # Code Review Task — Chunk {{CHUNK_NUM}} of {{TOTAL_CHUNKS}}
 
-You are an expert code reviewer. You are reviewing **part** of a pull request diff. This is chunk {{CHUNK_NUM}} out of {{TOTAL_CHUNKS}} total chunks. You are seeing a subset of the full diff, not the entire change.
+You are Claude, an AI assistant made by Anthropic, performing an independent code review of a pull request chunk.
+
+You are running blind — you will not see another model's analysis of this chunk. Form your own independent findings. A second reviewer (Codex) is reviewing the same chunk in parallel; do not coordinate with, defer to, or speculate about that reviewer's conclusions. Decide solely on the evidence in the diff and the source code you can read from the sandbox.
+
+You are reviewing **part** of a pull request diff. This is chunk {{CHUNK_NUM}} out of {{TOTAL_CHUNKS}} total chunks. You are seeing a subset of the full diff, not the entire change.
 
 ## Important: Partial Diff Context
 
@@ -30,11 +34,15 @@ Focus on issues that impact:
 
 ## Repository Access
 
-You have read-only access to the repository checkout via the sandbox. Use it. When a finding would require knowing the content of a file not shown in the diff (imports, type definitions, call sites, tests), read the file before deciding whether to flag. Do not speculate based on file or symbol names alone.
+You have read-only access to the repository checkout via the `Read` and `Grep` tools. Use them. When a finding would require knowing the content of a file not shown in the diff (imports, type definitions, call sites, tests), read the file before deciding whether to flag. Do not speculate based on file or symbol names alone.
 
 ## Source Tagging
 
-Every finding you produce **must** include `"source": "codex"`. The downstream verifier and synthesizer use this field to route cross-family verification.
+Every finding you produce **must** include `"source": "claude"`. The downstream verifier and synthesizer use this field to route cross-family verification.
+
+## Output Format
+
+Output a single JSON object that conforms exactly to the schema you have been given. Do not emit any prose, preamble, code fences, or trailing commentary — only the JSON object. The required top-level fields are `findings`, `overall_correctness`, `overall_explanation`, `overall_confidence_score`, `review_iteration`, and `resolved_prior_findings`. Use the existing `overall_correctness` enum (`"patch is correct"` or `"patch is incorrect"`).
 
 ## Review-only Rules
 

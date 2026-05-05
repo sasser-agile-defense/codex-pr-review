@@ -4,7 +4,7 @@ You are an expert code reviewer performing the final synthesis step of a chunked
 
 ## Chunk Review Results
 
-The following JSON array contains the review output from each chunk:
+The following JSON array contains the review output from each chunk. In v2 (P2+), the array is a single synthetic chunk whose `findings` are the **pre-verified merged finding list** produced by the cross-family grounded verifier. Each finding already carries `source` (`codex` or `claude`), `verifier_verdict` (`confirmed` / `inconclusive` — `refuted` findings have already been dropped), and `agreement` (`both` / `codex-only` / `claude-only` / `unconfirmed-by-{codex|claude}`). **Do not re-verify these findings against the diff and do not invent new ones based on the diff alone.** Your job is to merge, deduplicate, and label — preserving the verifier metadata verbatim.
 
 ```json
 {{CHUNK_RESULTS}}

@@ -1,0 +1,13 @@
+{
+  "title": "Null dereference in get_user_session at line 42",
+  "body": "The function get_user_session() returns None when the session token is missing, but the caller at tests/fixtures/hallucinated-finding-file.py:42 dereferences the returned object without a None check, which will raise AttributeError in production traffic.",
+  "confidence_score": 0.92,
+  "priority": 3,
+  "code_location": {
+    "path": "tests/fixtures/hallucinated-finding-file.py",
+    "start_line": 42,
+    "end_line": 44
+  },
+  "status": "new",
+  "source": "codex"
+}

@@ -1,0 +1,13 @@
+{
+  "title": "Null dereference: user.email when get_user returns None",
+  "body": "fetch_email() at tests/fixtures/real-bug-file.py:14 dereferences user.email without checking whether get_user returned None. Because get_user is shown to return None on cache miss in this fixture, this expression raises AttributeError. Add an explicit None check before the attribute access.",
+  "confidence_score": 0.95,
+  "priority": 3,
+  "code_location": {
+    "path": "tests/fixtures/real-bug-file.py",
+    "start_line": 14,
+    "end_line": 14
+  },
+  "status": "new",
+  "source": "codex"
+}

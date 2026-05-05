@@ -77,12 +77,12 @@ BEGIN {
         # chunk_size is a guideline for file/hunk boundary splits (handled above).
         # Within a hunk, we're generous: prefer one 8K chunk over two 5K + 3K
         # when the content is logically connected.
-        #   soft limit (1.5x): start looking for context lines to split at
-        #   hard limit (2.5x): force-split regardless
+        #   soft limit (1.2x): start looking for context lines to split at
+        #   hard limit (1.5x): force-split regardless
         total = chunk_lines + hunk_line_count
-        if (total >= chunk_size * 1.5) {
+        if (total >= chunk_size * 1.2) {
             is_context_line = (substr($0, 1, 1) == " " || $0 == "")
-            if (is_context_line || total >= chunk_size * 2.5) {
+            if (is_context_line || total >= chunk_size * 1.5) {
                 flush_hunk()
                 close_chunk()
                 in_hunk = 1  # still inside the same logical hunk

@@ -42,6 +42,8 @@ cp "$SCRIPT_DIR/scripts/codex-output-schema.json" "$SKILL_DIR/scripts/"
 cp "$SCRIPT_DIR/scripts/chunk-diff.awk" "$SKILL_DIR/scripts/"
 cp "$SCRIPT_DIR/scripts/codex-chunk-prompt.md" "$SKILL_DIR/scripts/"
 cp "$SCRIPT_DIR/scripts/codex-synthesis-prompt.md" "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/codex-verification-prompt.md" "$SKILL_DIR/scripts/"
+cp "$SCRIPT_DIR/scripts/codex-followup-context.md" "$SKILL_DIR/scripts/"
 
 # Make scripts executable
 chmod +x "$SKILL_DIR/scripts/review.sh"

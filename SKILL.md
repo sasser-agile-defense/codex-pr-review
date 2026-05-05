@@ -4,9 +4,9 @@ description: Review a pull request using OpenAI Codex (gpt-5.3-codex). Use when 
 license: MIT
 metadata:
   author: sasser
-  version: 0.3.0
+  version: 0.4.0
 allowed-tools: Bash
-argument-hint: "[PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL] [--chunk-size INT] [--max-diff-lines INT]"
+argument-hint: "[PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL] [--chunk-size INT] [--max-parallel INT] [--max-diff-lines INT] [--no-verify]"
 ---
 
 # Codex PR Review
@@ -28,7 +28,7 @@ Review a pull request using OpenAI Codex for an independent, cross-model code re
 /codex-pr-review --threshold 0.6          # Lower confidence threshold
 /codex-pr-review 123 --model gpt-5.2-codex  # Use a specific model
 /codex-pr-review --max-diff-lines 25000     # Increase diff safety limit
-/codex-pr-review --chunk-size 5000           # Smaller chunks for faster parallel reviews
+/codex-pr-review --chunk-size 3000           # Smaller chunks for faster parallel reviews
 /codex-pr-review --chunk-size 50 123         # Force chunking (useful for testing)
 ```
 
@@ -39,12 +39,14 @@ Review a pull request using OpenAI Codex for an independent, cross-model code re
 | `PR_NUMBER` or `PR_URL` | auto-detect | PR to review. If omitted, detects from current branch |
 | `--threshold` | `0.8` | Minimum confidence score (0-1) for reporting findings |
 | `--model` | `gpt-5.3-codex` | Codex model to use |
-| `--chunk-size` | `5000` | Lines per chunk. Diffs exceeding this are split and reviewed in parallel |
-| `--max-diff-lines` | `200000` | Safety limit — diffs beyond this are truncated |
+| `--chunk-size` | `3000` | Lines per chunk. Diffs exceeding this are split and reviewed in parallel |
+| `--max-parallel` | `6` | Max concurrent codex exec calls during chunked review |
+| `--max-diff-lines` | `0` | Safety truncation cap (0 = unlimited; chunking handles any size) |
+| `--no-verify` | off | Skip the post-synthesis verification pass |
 
 ## Large PR Support
 
-PRs with diffs exceeding the chunk size (default 5,000 lines) are automatically split into chunks and reviewed in parallel:
+PRs with diffs exceeding the chunk size (default 3,000 lines) are automatically split into chunks and reviewed in parallel:
 
 1. The diff is split along file and hunk boundaries (never mid-hunk) using an AWK script
 2. Each chunk is reviewed independently by a separate `codex exec` instance, running in parallel

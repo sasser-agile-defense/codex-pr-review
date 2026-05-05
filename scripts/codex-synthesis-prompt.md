@@ -30,9 +30,21 @@ The following JSON array contains the review output from each chunk:
 - Cross-chunk pattern findings should cite specific files and lines from the chunk results.
 - The final output must use the same JSON schema as individual chunk reviews.
 
+## Repository Access
+
+You have read-only access to the repository checkout via the sandbox. Use it. When a finding would require knowing the content of a file not shown in the diff (imports, type definitions, call sites, tests), read the file before deciding whether to flag. Do not speculate based on file or symbol names alone.
+
 {{PRIOR_REVIEW}}
 
 ## Pull Request Information
 
 **PR:** #{{PR_NUMBER}} — {{PR_TITLE}}
 **Branch:** {{HEAD_BRANCH}} → {{BASE_BRANCH}}
+
+## Raw Diff
+
+Use the raw diff below to spot-check chunk findings, deduplicate accurately, and verify cited line numbers against actual content.
+
+```diff
+{{DIFF}}
+```

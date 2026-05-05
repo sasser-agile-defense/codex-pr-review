@@ -4,18 +4,56 @@ set -euo pipefail
 # ─── Codex PR Review ─────────────────────────────────────────────────────────
 # Orchestrates a PR code review using OpenAI Codex CLI.
 # Usage: review.sh [PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL]
-#                  [--max-diff-lines INT] [--chunk-size INT]
+#                  [--max-diff-lines INT] [--chunk-size INT] [--max-parallel INT]
+#                  [--no-verify]
 # ──────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
+FAILURE_DIR=""   # populated by preserve_chunk_failures when there are any
+
+cleanup_work_dir() {
+  preserve_chunk_failures
+  rm -rf "$WORK_DIR"
+  if [[ -n "$FAILURE_DIR" ]]; then
+    echo "Chunk failure diagnostics saved to: $FAILURE_DIR" >&2
+  fi
+}
+
+# Copy any chunk stderr logs whose chunk output is missing or invalid JSON into
+# a persistent directory so the user can diagnose what went wrong.
+# Note: stderr and prompt files use the raw (unpadded) chunk number; output JSON
+# files use 3-digit zero-padded numbers. Bridge both when checking/copying.
+preserve_chunk_failures() {
+  [[ -d "$WORK_DIR" ]] || return 0
+  local stderr_log num padded out_file prompt_file
+  for stderr_log in "$WORK_DIR"/chunk-stderr-*.log; do
+    [[ -f "$stderr_log" ]] || continue
+    num="${stderr_log##*chunk-stderr-}"
+    num="${num%.log}"
+    padded=$(printf "%03d" "$num" 2>/dev/null || echo "$num")
+    out_file="$WORK_DIR/chunk-output-${padded}.json"
+    if [[ ! -f "$out_file" ]] || ! jq empty "$out_file" 2>/dev/null; then
+      if [[ -z "$FAILURE_DIR" ]]; then
+        FAILURE_DIR="/tmp/codex-pr-review-failures-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        mkdir -p "$FAILURE_DIR"
+      fi
+      cp "$stderr_log" "$FAILURE_DIR/chunk-${padded}-stderr.log" 2>/dev/null || true
+      prompt_file="$WORK_DIR/chunk-prompt-${num}.md"
+      [[ -f "$prompt_file" ]] && cp "$prompt_file" "$FAILURE_DIR/chunk-${padded}-prompt.md" 2>/dev/null || true
+    fi
+  done
+}
+
+trap cleanup_work_dir EXIT
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 THRESHOLD="0.8"
 MODEL="gpt-5.3-codex"
-MAX_DIFF_LINES="200000"
-CHUNK_SIZE="5000"
+MAX_DIFF_LINES="0"   # 0 = unlimited; chunking handles arbitrarily large diffs
+CHUNK_SIZE="3000"
+MAX_PARALLEL="6"     # concurrent codex exec calls during chunked review
+VERIFY_ENABLED="true"
 PR_ARG=""
 
 # ─── Arg Parsing ──────────────────────────────────────────────────────────────
@@ -36,6 +74,14 @@ while [[ $# -gt 0 ]]; do
     --chunk-size)
       CHUNK_SIZE="$2"
       shift 2
+      ;;
+    --max-parallel)
+      MAX_PARALLEL="$2"
+      shift 2
+      ;;
+    --no-verify)
+      VERIFY_ENABLED="false"
+      shift
       ;;
     -*)
       echo "Error: Unknown flag $1" >&2
@@ -170,6 +216,29 @@ gather_prior_review() {
   return 1
 }
 
+# ─── Build Manifest ─────────────────────────────────────────────────────────
+build_manifest() {
+  local diff_file="$1"
+  local out_file="$2"
+
+  {
+    echo "### Files changed in this PR"
+    grep -E '^diff --git ' "$diff_file" \
+      | sed -E 's|^diff --git a/([^ ]+) b/.*|- \1|' \
+      | sort -u
+
+    echo
+    echo "### Symbols added in this PR"
+    # Capture added lines defining functions/classes/consts across languages.
+    # Cheap heuristic — false positives are harmless, false negatives OK.
+    grep -E '^\+' "$diff_file" \
+      | grep -vE '^\+\+\+ ' \
+      | grep -oE '(def|class|function|const|let|var|fn|pub fn|type|interface|struct|enum|export (default )?(function|class|const|interface|type))[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
+      | sort -u \
+      | head -200
+  } > "$out_file"
+}
+
 # ─── Build Follow-up Context ────────────────────────────────────────────────
 build_followup_context() {
   local prior_review_json="$1"
@@ -193,91 +262,189 @@ build_followup_context() {
   echo "$template"
 }
 
-# ─── Build Prompt ─────────────────────────────────────────────────────────────
+# ─── Build Prompt (file-based to avoid bash O(n*m) substitution on large diffs)
 build_prompt() {
   local pr_number="$1"
   local pr_title="$2"
   local head_branch="$3"
   local base_branch="$4"
-  local diff="$5"
+  local diff_file="$5"   # path to diff file (NOT inline content)
   local project_rules="$6"
   local followup_context="$7"
+  local manifest_file="$8"  # path to manifest file
+  local output_file="$9"  # path to write filled prompt
 
-  local template
-  template=$(cat "$SCRIPT_DIR/codex-prompt.md")
-
-  # Template substitution
   local project_rules_section=""
   if [[ -n "$project_rules" ]]; then
     project_rules_section="$project_rules"
   fi
 
-  template="${template//\{\{PROJECT_RULES\}\}/$project_rules_section}"
-  template="${template//\{\{PRIOR_REVIEW\}\}/$followup_context}"
-  template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
-  template="${template//\{\{PR_TITLE\}\}/$pr_title}"
-  template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
-  template="${template//\{\{BASE_BRANCH\}\}/$base_branch}"
-  template="${template//\{\{DIFF\}\}/$diff}"
+  local manifest_content=""
+  if [[ -n "$manifest_file" && -f "$manifest_file" ]]; then
+    manifest_content=$(cat "$manifest_file")
+  fi
 
-  echo "$template"
+  # Use sed for small single-line placeholders (BSD sed can't handle newlines
+  # in replacement text, so multi-line values go through perl below).
+  LC_ALL=C sed \
+    -e "s|{{PR_NUMBER}}|${pr_number}|g" \
+    -e "s|{{PR_TITLE}}|${pr_title}|g" \
+    -e "s|{{HEAD_BRANCH}}|${head_branch}|g" \
+    -e "s|{{BASE_BRANCH}}|${base_branch}|g" \
+    "$SCRIPT_DIR/codex-prompt.md" > "$WORK_DIR/_prompt_template_pre.md"
+
+  PROJECT_RULES_VAL="$project_rules_section" \
+  PRIOR_REVIEW_VAL="$followup_context" \
+  MANIFEST_VAL="$manifest_content" \
+  perl -pe '
+    BEGIN {
+      $pr  = $ENV{PROJECT_RULES_VAL};
+      $prv = $ENV{PRIOR_REVIEW_VAL};
+      $mf  = $ENV{MANIFEST_VAL};
+    }
+    s/\Q{{PROJECT_RULES}}\E/$pr/g;
+    s/\Q{{PRIOR_REVIEW}}\E/$prv/g;
+    s/\Q{{MANIFEST}}\E/$mf/g;
+  ' "$WORK_DIR/_prompt_template_pre.md" > "$WORK_DIR/_prompt_template.md"
+
+  # Split on {{DIFF}} line and splice diff file in between
+  local line_num
+  line_num=$(grep -n '{{DIFF}}' "$WORK_DIR/_prompt_template.md" | head -1 | cut -d: -f1)
+  if [[ -n "$line_num" ]]; then
+    head -n "$((line_num - 1))" "$WORK_DIR/_prompt_template.md" > "$output_file"
+    cat "$diff_file" >> "$output_file"
+    tail -n "+$((line_num + 1))" "$WORK_DIR/_prompt_template.md" >> "$output_file"
+  else
+    # No {{DIFF}} marker — just use template as-is
+    cp "$WORK_DIR/_prompt_template.md" "$output_file"
+  fi
 }
 
-# ─── Build Chunk Prompt ──────────────────────────────────────────────────────
+# ─── Build Chunk Prompt (file-based) ────────────────────────────────────────
 build_chunk_prompt() {
   local pr_number="$1"
   local pr_title="$2"
   local head_branch="$3"
   local base_branch="$4"
-  local diff="$5"
+  local diff_file="$5"   # path to chunk diff file
   local project_rules="$6"
   local chunk_num="$7"
   local total_chunks="$8"
   local followup_context="$9"
-
-  local template
-  template=$(cat "$SCRIPT_DIR/codex-chunk-prompt.md")
+  local manifest_file="${10}"  # path to manifest file
+  local output_file="${11}"  # path to write filled prompt
 
   local project_rules_section=""
   if [[ -n "$project_rules" ]]; then
     project_rules_section="$project_rules"
   fi
 
-  template="${template//\{\{PROJECT_RULES\}\}/$project_rules_section}"
-  template="${template//\{\{PRIOR_REVIEW\}\}/$followup_context}"
-  template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
-  template="${template//\{\{PR_TITLE\}\}/$pr_title}"
-  template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
-  template="${template//\{\{BASE_BRANCH\}\}/$base_branch}"
-  template="${template//\{\{DIFF\}\}/$diff}"
-  template="${template//\{\{CHUNK_NUM\}\}/$chunk_num}"
-  template="${template//\{\{TOTAL_CHUNKS\}\}/$total_chunks}"
+  local manifest_content=""
+  if [[ -n "$manifest_file" && -f "$manifest_file" ]]; then
+    manifest_content=$(cat "$manifest_file")
+  fi
 
-  echo "$template"
+  # BSD sed can't handle newlines in replacement text, so multi-line values
+  # go through perl below.
+  LC_ALL=C sed \
+    -e "s|{{PR_NUMBER}}|${pr_number}|g" \
+    -e "s|{{PR_TITLE}}|${pr_title}|g" \
+    -e "s|{{HEAD_BRANCH}}|${head_branch}|g" \
+    -e "s|{{BASE_BRANCH}}|${base_branch}|g" \
+    -e "s|{{CHUNK_NUM}}|${chunk_num}|g" \
+    -e "s|{{TOTAL_CHUNKS}}|${total_chunks}|g" \
+    "$SCRIPT_DIR/codex-chunk-prompt.md" > "$WORK_DIR/_chunk_template_pre_${chunk_num}.md"
+
+  PROJECT_RULES_VAL="$project_rules_section" \
+  PRIOR_REVIEW_VAL="$followup_context" \
+  MANIFEST_VAL="$manifest_content" \
+  perl -pe '
+    BEGIN {
+      $pr  = $ENV{PROJECT_RULES_VAL};
+      $prv = $ENV{PRIOR_REVIEW_VAL};
+      $mf  = $ENV{MANIFEST_VAL};
+    }
+    s/\Q{{PROJECT_RULES}}\E/$pr/g;
+    s/\Q{{PRIOR_REVIEW}}\E/$prv/g;
+    s/\Q{{MANIFEST}}\E/$mf/g;
+  ' "$WORK_DIR/_chunk_template_pre_${chunk_num}.md" > "$WORK_DIR/_chunk_template_${chunk_num}.md"
+
+  local line_num
+  line_num=$(grep -n '{{DIFF}}' "$WORK_DIR/_chunk_template_${chunk_num}.md" | head -1 | cut -d: -f1)
+  if [[ -n "$line_num" ]]; then
+    head -n "$((line_num - 1))" "$WORK_DIR/_chunk_template_${chunk_num}.md" > "$output_file"
+    cat "$diff_file" >> "$output_file"
+    tail -n "+$((line_num + 1))" "$WORK_DIR/_chunk_template_${chunk_num}.md" >> "$output_file"
+  else
+    cp "$WORK_DIR/_chunk_template_${chunk_num}.md" "$output_file"
+  fi
 }
 
-# ─── Build Synthesis Prompt ──────────────────────────────────────────────────
+# ─── Build Synthesis Prompt (file-based) ────────────────────────────────────
 build_synthesis_prompt() {
   local pr_number="$1"
   local pr_title="$2"
   local head_branch="$3"
   local base_branch="$4"
-  local chunk_results="$5"
+  local chunk_results_file="$5"  # path to chunk results file
   local total_chunks="$6"
   local followup_context="$7"
+  local diff_file="$8"  # path to full raw diff file
+  local output_file="$9"  # path to write filled prompt
 
-  local template
-  template=$(cat "$SCRIPT_DIR/codex-synthesis-prompt.md")
+  LC_ALL=C sed \
+    -e "s|{{PRIOR_REVIEW}}|${followup_context}|g" \
+    -e "s|{{PR_NUMBER}}|${pr_number}|g" \
+    -e "s|{{PR_TITLE}}|${pr_title}|g" \
+    -e "s|{{HEAD_BRANCH}}|${head_branch}|g" \
+    -e "s|{{BASE_BRANCH}}|${base_branch}|g" \
+    -e "s|{{TOTAL_CHUNKS}}|${total_chunks}|g" \
+    "$SCRIPT_DIR/codex-synthesis-prompt.md" > "$WORK_DIR/_synthesis_template.md"
 
-  template="${template//\{\{PRIOR_REVIEW\}\}/$followup_context}"
-  template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
-  template="${template//\{\{PR_TITLE\}\}/$pr_title}"
-  template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
-  template="${template//\{\{BASE_BRANCH\}\}/$base_branch}"
-  template="${template//\{\{CHUNK_RESULTS\}\}/$chunk_results}"
-  template="${template//\{\{TOTAL_CHUNKS\}\}/$total_chunks}"
+  # Splice chunk results at {{CHUNK_RESULTS}}
+  local line_num
+  line_num=$(grep -n '{{CHUNK_RESULTS}}' "$WORK_DIR/_synthesis_template.md" | head -1 | cut -d: -f1)
+  if [[ -n "$line_num" ]]; then
+    head -n "$((line_num - 1))" "$WORK_DIR/_synthesis_template.md" > "$WORK_DIR/_synthesis_pre_diff.md"
+    cat "$chunk_results_file" >> "$WORK_DIR/_synthesis_pre_diff.md"
+    tail -n "+$((line_num + 1))" "$WORK_DIR/_synthesis_template.md" >> "$WORK_DIR/_synthesis_pre_diff.md"
+  else
+    cp "$WORK_DIR/_synthesis_template.md" "$WORK_DIR/_synthesis_pre_diff.md"
+  fi
 
-  echo "$template"
+  # Decide whether to inline the raw diff or substitute a pointer sentence.
+  # If the user set --max-diff-lines, use half that as the cap. Otherwise use
+  # a sensible absolute cap so the synthesis prompt stays within context.
+  local diff_threshold
+  if [[ "$MAX_DIFF_LINES" -gt 0 ]]; then
+    diff_threshold=$((MAX_DIFF_LINES / 2))
+  else
+    diff_threshold=30000
+  fi
+  local diff_lines=0
+  if [[ -n "$diff_file" && -f "$diff_file" ]]; then
+    diff_lines=$(wc -l < "$diff_file" | tr -d ' ')
+  fi
+
+  local diff_line_num
+  diff_line_num=$(grep -n '{{DIFF}}' "$WORK_DIR/_synthesis_pre_diff.md" | head -1 | cut -d: -f1)
+  if [[ -z "$diff_line_num" ]]; then
+    # No {{DIFF}} marker — just use as-is
+    cp "$WORK_DIR/_synthesis_pre_diff.md" "$output_file"
+    return
+  fi
+
+  if [[ -n "$diff_file" && -f "$diff_file" && "$diff_lines" -le "$diff_threshold" ]]; then
+    # Inline raw diff
+    head -n "$((diff_line_num - 1))" "$WORK_DIR/_synthesis_pre_diff.md" > "$output_file"
+    cat "$diff_file" >> "$output_file"
+    tail -n "+$((diff_line_num + 1))" "$WORK_DIR/_synthesis_pre_diff.md" >> "$output_file"
+  else
+    # Substitute pointer sentence
+    head -n "$((diff_line_num - 1))" "$WORK_DIR/_synthesis_pre_diff.md" > "$output_file"
+    printf '%s\n' "The raw diff exceeds the synthesis budget. Rely on chunk outputs and use sandbox access if you need to verify specific files." >> "$output_file"
+    tail -n "+$((diff_line_num + 1))" "$WORK_DIR/_synthesis_pre_diff.md" >> "$output_file"
+  fi
 }
 
 # ─── Review Single Chunk (background job) ────────────────────────────────────
@@ -292,29 +459,34 @@ review_chunk() {
   local project_rules="$8"
   local output_file="$9"
   local followup_context="${10}"
-
-  local chunk_diff
-  chunk_diff=$(cat "$chunk_file")
-
-  local prompt
-  prompt=$(build_chunk_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_diff" "$project_rules" "$chunk_num" "$total_chunks" "$followup_context")
+  local manifest_file="${11}"
 
   local prompt_file="$WORK_DIR/chunk-prompt-${chunk_num}.md"
-  echo "$prompt" > "$prompt_file"
+  build_chunk_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" \
+    "$chunk_file" "$project_rules" "$chunk_num" "$total_chunks" "$followup_context" "$manifest_file" "$prompt_file"
 
-  if codex exec \
-    --model "$MODEL" \
-    --output-schema "$WORK_DIR/codex-output-schema.json" \
-    --sandbox read-only \
-    - < "$prompt_file" > "$output_file" 2>"$WORK_DIR/chunk-stderr-${chunk_num}.log"; then
-    # Validate JSON
-    if jq empty "$output_file" 2>/dev/null; then
-      echo "  Chunk $chunk_num/$total_chunks completed." >&2
-      return 0
+  local max_attempts=3
+  local attempt=0
+  # Per-attempt backoff (index 0 unused; 1→2s, 2→5s before retry).
+  local backoffs=(0 2 5)
+  while [[ $attempt -lt $max_attempts ]]; do
+    attempt=$((attempt + 1))
+    if codex exec \
+      --model "$MODEL" \
+      --output-schema "$WORK_DIR/codex-output-schema.json" \
+      --sandbox read-only \
+      - < "$prompt_file" > "$output_file" 2>"$WORK_DIR/chunk-stderr-${chunk_num}.log"; then
+      if jq empty "$output_file" 2>/dev/null; then
+        echo "  Chunk $chunk_num/$total_chunks completed$([ $attempt -gt 1 ] && echo " (retry $((attempt-1)))")." >&2
+        return 0
+      fi
     fi
-  fi
+    if [[ $attempt -lt $max_attempts ]]; then
+      sleep "${backoffs[$attempt]}"
+    fi
+  done
 
-  echo "  Chunk $chunk_num/$total_chunks FAILED." >&2
+  echo "  Chunk $chunk_num/$total_chunks FAILED after $max_attempts attempts." >&2
   return 1
 }
 
@@ -324,15 +496,15 @@ run_single_review() {
   local pr_title="$2"
   local head_branch="$3"
   local base_branch="$4"
-  local diff="$5"
+  local diff_file="$5"   # path to diff file
   local project_rules="$6"
   local followup_context="$7"
+  local manifest_file="$8"
 
   # Build prompt
   echo "Building review prompt..." >&2
-  local prompt
-  prompt=$(build_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules" "$followup_context")
-  echo "$prompt" > "$WORK_DIR/codex-prompt-filled.md"
+  build_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" \
+    "$diff_file" "$project_rules" "$followup_context" "$manifest_file" "$WORK_DIR/codex-prompt-filled.md"
 
   # Copy schema to work dir
   cp "$SCRIPT_DIR/codex-output-schema.json" "$WORK_DIR/"
@@ -369,22 +541,19 @@ run_chunked_review() {
   local pr_title="$2"
   local head_branch="$3"
   local base_branch="$4"
-  local diff="$5"
+  local diff_file="$5"   # path to diff file
   local project_rules="$6"
   local followup_context="$7"
+  local manifest_file="$8"
 
   # Copy schema to work dir
   cp "$SCRIPT_DIR/codex-output-schema.json" "$WORK_DIR/"
-
-  # Write diff to file and split into chunks
-  local diff_file="$WORK_DIR/full-diff.txt"
-  echo "$diff" > "$diff_file"
 
   local chunk_dir="$WORK_DIR/chunks"
   mkdir -p "$chunk_dir"
 
   echo "Splitting diff into chunks (chunk size: $CHUNK_SIZE lines)..." >&2
-  awk -v chunk_size="$CHUNK_SIZE" -v output_dir="$chunk_dir" \
+  LC_ALL=C awk -v chunk_size="$CHUNK_SIZE" -v output_dir="$chunk_dir" \
     -f "$SCRIPT_DIR/chunk-diff.awk" < "$diff_file"
 
   local total_chunks
@@ -394,35 +563,49 @@ run_chunked_review() {
   # If chunking produced only 1 chunk, fall back to single review
   if [[ "$total_chunks" -eq 1 ]]; then
     echo "Only 1 chunk produced, using single review path." >&2
-    local single_diff
-    single_diff=$(cat "$chunk_dir/chunk_001.diff")
-    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$single_diff" "$project_rules" "$followup_context"
+    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_dir/chunk_001.diff" "$project_rules" "$followup_context" "$manifest_file"
     return
   fi
 
-  # Launch parallel chunk reviews
-  echo "Launching $total_chunks parallel chunk reviews..." >&2
-  local pids=()
-  local chunk_outputs=()
+  # Launch chunk reviews in batches of MAX_PARALLEL to avoid overwhelming the
+  # codex CLI and OpenAI rate limits.
+  echo "Launching chunk reviews ($total_chunks total, max $MAX_PARALLEL concurrent)..." >&2
+  local batch_pids=()
 
   for i in $(seq 1 "$total_chunks"); do
     local padded
     padded=$(printf "%03d" "$i")
     local chunk_file="$chunk_dir/chunk_${padded}.diff"
     local output_file="$WORK_DIR/chunk-output-${padded}.json"
-    chunk_outputs+=("$output_file")
 
     review_chunk "$chunk_file" "$i" "$total_chunks" \
       "$pr_number" "$pr_title" "$head_branch" "$base_branch" \
-      "$project_rules" "$output_file" "$followup_context" &
-    pids+=($!)
+      "$project_rules" "$output_file" "$followup_context" "$manifest_file" &
+    batch_pids+=($!)
+
+    # If batch is full, drain before launching more.
+    if [[ ${#batch_pids[@]} -ge $MAX_PARALLEL ]]; then
+      for p in "${batch_pids[@]}"; do
+        wait "$p" || true
+      done
+      batch_pids=()
+    fi
   done
 
-  # Wait for all chunks and count failures
+  # Drain the final partial batch.
+  for p in "${batch_pids[@]}"; do
+    wait "$p" || true
+  done
+
+  # Count successes/failures by inspecting output files (authoritative since
+  # review_chunk writes valid JSON only on success).
   local failures=0
   local succeeded=0
-  for i in "${!pids[@]}"; do
-    if wait "${pids[$i]}"; then
+  for i in $(seq 1 "$total_chunks"); do
+    local padded
+    padded=$(printf "%03d" "$i")
+    local output_file="$WORK_DIR/chunk-output-${padded}.json"
+    if [[ -f "$output_file" ]] && jq empty "$output_file" 2>/dev/null; then
       succeeded=$((succeeded + 1))
     else
       failures=$((failures + 1))
@@ -430,6 +613,9 @@ run_chunked_review() {
   done
 
   echo "Chunk reviews complete: $succeeded succeeded, $failures failed." >&2
+
+  # Persist chunk stats so format_comment can warn about incomplete coverage.
+  printf '%s\n%s\n' "$succeeded" "$failures" > "$WORK_DIR/chunk-stats.txt"
 
   # If ALL chunks failed, exit
   if [[ "$succeeded" -eq 0 ]]; then
@@ -446,9 +632,10 @@ run_chunked_review() {
     exit 3
   fi
 
-  # Build chunk results JSON array from successful outputs
+  # Build chunk results JSON array from successful outputs (write to file)
   echo "Synthesizing chunk results..." >&2
-  local chunk_results="["
+  local chunk_results_file="$WORK_DIR/chunk-results.json"
+  printf "[" > "$chunk_results_file"
   local first=true
 
   for i in $(seq 1 "$total_chunks"); do
@@ -460,21 +647,18 @@ run_chunked_review() {
       if [[ "$first" == "true" ]]; then
         first=false
       else
-        chunk_results+=","
+        printf "," >> "$chunk_results_file"
       fi
-      # Wrap each chunk result with its chunk number
-      chunk_results+=$(jq -c --argjson n "$i" '{chunk: $n, result: .}' "$output_file")
+      jq -c --argjson n "$i" '{chunk: $n, result: .}' "$output_file" >> "$chunk_results_file"
     fi
   done
 
-  chunk_results+="]"
+  printf "]" >> "$chunk_results_file"
 
   # Build and run synthesis prompt
-  local synthesis_prompt
-  synthesis_prompt=$(build_synthesis_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_results" "$total_chunks" "$followup_context")
-
   local synthesis_prompt_file="$WORK_DIR/synthesis-prompt.md"
-  echo "$synthesis_prompt" > "$synthesis_prompt_file"
+  build_synthesis_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" \
+    "$chunk_results_file" "$total_chunks" "$followup_context" "$diff_file" "$synthesis_prompt_file"
 
   echo "Running synthesis review..." >&2
   if ! codex exec \
@@ -499,6 +683,82 @@ run_chunked_review() {
     echo "Error: Synthesis output is not valid JSON." >&2
     exit 3
   fi
+
+  # Optional verification pass (chunked path only). Non-blocking.
+  if [[ "$VERIFY_ENABLED" == "true" ]]; then
+    run_verification_pass "$WORK_DIR/codex-output.json" "$diff_file" \
+      || echo "Warning: verification pass failed; using unverified output." >&2
+  fi
+}
+
+# ─── Verification Pass ──────────────────────────────────────────────────────
+run_verification_pass() {
+  local output_file="$1"   # current codex-output.json (will be overwritten on success)
+  local diff_file="$2"     # raw diff
+
+  if [[ ! -f "$output_file" ]] || ! jq empty "$output_file" 2>/dev/null; then
+    echo "Warning: verification pass skipped; output JSON missing or invalid." >&2
+    return 1
+  fi
+
+  # Extract just the findings array for the prompt
+  local findings_file="$WORK_DIR/verification-findings.json"
+  if ! jq -c '.findings // []' "$output_file" > "$findings_file" 2>/dev/null; then
+    echo "Warning: verification pass skipped; could not extract findings." >&2
+    return 1
+  fi
+
+  # Build verification prompt
+  local verification_prompt_file="$WORK_DIR/verification-prompt.md"
+  cp "$SCRIPT_DIR/codex-verification-prompt.md" "$WORK_DIR/_verification_template.md"
+
+  # Splice {{DIFF}}
+  local diff_line_num
+  diff_line_num=$(grep -n '{{DIFF}}' "$WORK_DIR/_verification_template.md" | head -1 | cut -d: -f1)
+  if [[ -n "$diff_line_num" ]]; then
+    head -n "$((diff_line_num - 1))" "$WORK_DIR/_verification_template.md" > "$WORK_DIR/_verification_post_diff.md"
+    cat "$diff_file" >> "$WORK_DIR/_verification_post_diff.md"
+    tail -n "+$((diff_line_num + 1))" "$WORK_DIR/_verification_template.md" >> "$WORK_DIR/_verification_post_diff.md"
+  else
+    cp "$WORK_DIR/_verification_template.md" "$WORK_DIR/_verification_post_diff.md"
+  fi
+
+  # Splice {{FINDINGS}}
+  local findings_line_num
+  findings_line_num=$(grep -n '{{FINDINGS}}' "$WORK_DIR/_verification_post_diff.md" | head -1 | cut -d: -f1)
+  if [[ -n "$findings_line_num" ]]; then
+    head -n "$((findings_line_num - 1))" "$WORK_DIR/_verification_post_diff.md" > "$verification_prompt_file"
+    cat "$findings_file" >> "$verification_prompt_file"
+    tail -n "+$((findings_line_num + 1))" "$WORK_DIR/_verification_post_diff.md" >> "$verification_prompt_file"
+  else
+    cp "$WORK_DIR/_verification_post_diff.md" "$verification_prompt_file"
+  fi
+
+  # Run codex verification (non-blocking — failures must not fail the review)
+  local verified_out="$WORK_DIR/codex-output-verified.json"
+  echo "Running verification pass..." >&2
+  if ! codex exec \
+    --model "$MODEL" \
+    --output-schema "$WORK_DIR/codex-output-schema.json" \
+    --sandbox read-only \
+    - < "$verification_prompt_file" > "$verified_out" 2>"$WORK_DIR/verification-stderr.log"; then
+    echo "Warning: verification codex exec failed; keeping unverified output." >&2
+    if [[ -f "$WORK_DIR/verification-stderr.log" ]]; then
+      cat "$WORK_DIR/verification-stderr.log" >&2
+    fi
+    return 1
+  fi
+
+  # Validate verified output
+  if [[ ! -s "$verified_out" ]] || ! jq empty "$verified_out" 2>/dev/null; then
+    echo "Warning: verification output invalid JSON; keeping unverified output." >&2
+    return 1
+  fi
+
+  # Overwrite the original output with the verified version
+  mv "$verified_out" "$output_file"
+  echo "Verification pass complete." >&2
+  return 0
 }
 
 # ─── Format Comment ──────────────────────────────────────────────────────────
@@ -632,6 +892,18 @@ format_comment() {
     iteration_label=" | Follow-up #$review_iteration"
   fi
   comment+="---"$'\n'
+
+  # Warn about incomplete coverage if any chunks failed during chunked review.
+  if [[ -f "$WORK_DIR/chunk-stats.txt" ]]; then
+    local stats_succeeded stats_failed
+    stats_succeeded=$(sed -n '1p' "$WORK_DIR/chunk-stats.txt")
+    stats_failed=$(sed -n '2p' "$WORK_DIR/chunk-stats.txt")
+    if [[ "$stats_failed" -gt 0 ]]; then
+      local total_c=$((stats_succeeded + stats_failed))
+      comment+="> ⚠️ **Incomplete coverage:** ${stats_failed} of ${total_c} chunks failed during review. Findings below reflect only the ${stats_succeeded} successful chunks. Consider retrying or reducing \`--max-parallel\`."$'\n\n'
+    fi
+  fi
+
   comment+="*Reviewed by OpenAI Codex ($MODEL)${iteration_label} | Threshold: $THRESHOLD | $total_findings total findings, $filtered_count reported*"
 
   # Embed review data for future follow-up reviews
@@ -688,23 +960,32 @@ main() {
   local head_sha
   head_sha=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
-  # Gather diff
+  # Gather diff — write directly to file to avoid storing huge diffs in bash variables
   echo "Gathering diff..." >&2
-  local diff
-  diff=$(gh pr diff "$pr_number")
+  local diff_file="$WORK_DIR/full-diff.txt"
+  gh pr diff "$pr_number" > "$diff_file" 2>/dev/null || true
 
-  if [[ -z "$diff" ]]; then
+  if [[ ! -s "$diff_file" ]]; then
+    echo "  gh pr diff failed (diff may be too large for GitHub API). Falling back to git diff..." >&2
+    git fetch origin "$base_branch" "$head_branch" 2>/dev/null || true
+    git diff "origin/${base_branch}...origin/${head_branch}" > "$diff_file" 2>/dev/null || true
+  fi
+
+  if [[ ! -s "$diff_file" ]]; then
     echo "Error: PR diff is empty." >&2
     exit 2
   fi
 
-  # Safety valve: truncate truly enormous diffs
+  # Optional safety valve: truncate only if user explicitly sets --max-diff-lines > 0.
+  # Default (0) reviews the full diff — chunking handles arbitrarily large diffs.
   local diff_lines
-  diff_lines=$(echo "$diff" | wc -l | tr -d ' ')
-  if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
-    echo "Warning: Diff is $diff_lines lines, truncating to $MAX_DIFF_LINES (safety limit)." >&2
-    diff=$(echo "$diff" | head -n "$MAX_DIFF_LINES")
-    diff+=$'\n\n... (diff truncated at '"$MAX_DIFF_LINES"' lines)'
+  diff_lines=$(wc -l < "$diff_file" | tr -d ' ')
+  if [[ "$MAX_DIFF_LINES" -gt 0 && "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
+    echo "Warning: Diff is $diff_lines lines; truncating to $MAX_DIFF_LINES per --max-diff-lines. This drops $((diff_lines - MAX_DIFF_LINES)) lines from the review." >&2
+    local truncated="$WORK_DIR/diff-truncated.txt"
+    head -n "$MAX_DIFF_LINES" "$diff_file" > "$truncated"
+    printf '\n\n... (diff truncated at %s lines)\n' "$MAX_DIFF_LINES" >> "$truncated"
+    mv "$truncated" "$diff_file"
     diff_lines="$MAX_DIFF_LINES"
   fi
 
@@ -713,13 +994,18 @@ main() {
   local project_rules
   project_rules=$(gather_project_rules)
 
+  # Build PR-wide manifest of files and symbols
+  echo "Building PR manifest..." >&2
+  local manifest_file="$WORK_DIR/manifest.md"
+  build_manifest "$diff_file" "$manifest_file"
+
   # Route: single review vs chunked review
   if [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
     echo "Diff is $diff_lines lines (within chunk size $CHUNK_SIZE), using single review." >&2
-    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules" "$followup_context"
+    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff_file" "$project_rules" "$followup_context" "$manifest_file"
   else
     echo "Diff is $diff_lines lines (exceeds chunk size $CHUNK_SIZE), using chunked review." >&2
-    run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules" "$followup_context"
+    run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff_file" "$project_rules" "$followup_context" "$manifest_file"
   fi
 
   # Format and post (same for both paths — both produce codex-output.json)

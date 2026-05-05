@@ -32,9 +32,18 @@ Focus on issues that impact:
 
 You have read-only access to the repository checkout via the sandbox. Use it. When a finding would require knowing the content of a file not shown in the diff (imports, type definitions, call sites, tests), read the file before deciding whether to flag. Do not speculate based on file or symbol names alone.
 
-## Source Tagging
+## Source Tagging and v2 Placeholder Fields
 
-Every finding you produce **must** include `"source": "codex"`. The downstream verifier and synthesizer use this field to route cross-family verification.
+Every finding you produce **must** include the following fields exactly:
+- `"source": "codex"` — identifies you as the originating reviewer.
+- `"verifier_verdict": "n/a"` — placeholder; the cross-family verifier overwrites this downstream. Always emit `"n/a"`.
+- `"agreement": "codex-only"` — placeholder; the merge step promotes this to `"both"` when Claude flags the same issue. Always emit `"codex-only"` here.
+
+At the top level of your response object, also emit:
+- `"iteration_meta": null`
+- `"delta": null`
+
+These are populated by the orchestrator and the synthesizer downstream, not by you.
 
 ## Review-only Rules
 

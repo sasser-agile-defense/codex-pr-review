@@ -6,7 +6,7 @@ metadata:
   author: sasser
   version: 2.0.0
 allowed-tools: Bash
-argument-hint: "[PR_NUMBER|PR_URL] [--mode auto|initial|followup|delta] [--threshold FLOAT] [--model-codex MODEL] [--model-claude MODEL] [--model-verifier MODEL] [--chunker auto|ast|hunk] [--review-rules PATH] [--max-parallel INT] [--max-diff-lines INT] [--chunk-size INT] [--no-verify] [--no-deterministic]"
+argument-hint: "[PR_NUMBER|PR_URL] [--mode auto|initial|followup|delta] [--threshold FLOAT] [--model-codex MODEL] [--model-claude MODEL] [--model-verifier MODEL] [--chunker auto|ast|hunk] [--review-rules PATH] [--max-parallel INT] [--max-diff-lines INT] [--chunk-size INT] [--no-verify] [--no-deterministic] [--dry-run]"
 ---
 
 # Codex PR Review (v2)
@@ -33,6 +33,7 @@ Review a pull request using a dual-family pipeline — Codex (`gpt-5.3-codex`) a
 /codex-pr-review --chunker ast                # Force AST-aware chunking
 /codex-pr-review --no-verify                  # Skip the cross-family verifier (debug only)
 /codex-pr-review --no-deterministic           # Skip the lint/typecheck/test floor
+/codex-pr-review --dry-run                    # Render the review but do NOT post it to the PR
 ```
 
 ## Arguments
@@ -52,6 +53,7 @@ Review a pull request using a dual-family pipeline — Codex (`gpt-5.3-codex`) a
 | `--max-diff-lines` | `0` | Safety truncation cap (0 = unlimited) |
 | `--no-verify` | off | Skip the cross-family grounded verifier (debug only) |
 | `--no-deterministic` | off | Skip the lint/typecheck/test floor |
+| `--dry-run` | off | Render the review but do NOT post it; write to stdout and `/tmp/codex-pr-review-dry-run-*.md` |
 
 ## Large PR Support
 

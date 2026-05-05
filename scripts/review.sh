@@ -133,6 +133,11 @@ NO_DETERMINISTIC="false"
 # v2 additions (P4):
 MODE="auto"   # auto | initial | followup | delta — iteration mode override
 
+# Smoke-test affordance: when true, write the rendered comment to stdout and to
+# a stable file under /tmp instead of calling `gh pr comment`. Useful for
+# verifying the v2 pipeline against a real PR without mutating the PR thread.
+DRY_RUN="false"
+
 # ─── Arg Parsing ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -197,6 +202,10 @@ while [[ $# -gt 0 ]]; do
       esac
       shift 2
       ;;
+    --dry-run)
+      DRY_RUN="true"
+      shift
+      ;;
     -h|--help)
       cat >&2 <<'USAGE'
 Usage: review.sh [PR_NUMBER|PR_URL] [options]
@@ -215,6 +224,8 @@ Options:
   --no-verify            Skip the cross-family verifier (debug only)
   --no-deterministic     Skip the deterministic lint/typecheck/test floor
   --mode MODE            auto | initial | followup | delta (default auto)
+  --dry-run              Render the review but do NOT post it to the PR; write
+                         it to stdout and to /tmp/codex-pr-review-dry-run-*.md
   -h, --help             Show this help and exit
 USAGE
       exit 0
@@ -297,6 +308,16 @@ check_prereqs() {
   else
     echo "Note: node not found on PATH. v2 AST chunker (plan.js) will fall back to AWK chunker." >&2
   fi
+}
+
+# Returns 0 (true) when the v2 dual-family pipeline (Codex + Claude in parallel
+# + cross-family grounded verifier) can run, else 1 (false). Used to route the
+# single-vs-chunked decision in main(): v2 always uses the chunked code path
+# (which handles 1-chunk diffs correctly) so small PRs still get the headline
+# anti-hallucination feature. v1 single-review is the graceful-degradation
+# fallback when claude CLI is missing or the user opted out via --no-verify.
+v2_dual_family_enabled() {
+  command -v claude &>/dev/null && [[ "$VERIFY_ENABLED" == "true" ]]
 }
 
 # ─── PR Detection ─────────────────────────────────────────────────────────────
@@ -1427,9 +1448,13 @@ run_chunked_review() {
   total_chunks=$(cat "$chunk_dir/chunk_count.txt")
   echo "Split into $total_chunks chunks (mode: $([ "$used_ast" -eq 1 ] && echo ast || echo hunk))." >&2
 
-  # If chunking produced only 1 chunk, fall back to single review
-  if [[ "$total_chunks" -eq 1 ]]; then
-    echo "Only 1 chunk produced, using single review path." >&2
+  # If chunking produced only 1 chunk AND v2 dual-family is unavailable, fall
+  # back to single review (Codex-only). When v2 is available the chunked path
+  # works fine with 1 chunk and gives us the full dual-family + verifier flow,
+  # which is the headline anti-hallucination feature. v1 fallback is the
+  # graceful-degradation path when claude CLI is missing or --no-verify is set.
+  if [[ "$total_chunks" -eq 1 ]] && ! v2_dual_family_enabled; then
+    echo "Only 1 chunk produced and v2 dual-family unavailable; using single review path." >&2
     run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_dir/chunk_001.diff" "$project_rules" "$followup_context" "$manifest_file"
     return
   fi
@@ -1465,9 +1490,11 @@ run_chunked_review() {
     fi
   done
 
-  for p in "${batch_pids[@]}"; do
-    wait "$p" || true
-  done
+  if [[ ${#batch_pids[@]} -gt 0 ]]; then
+    for p in "${batch_pids[@]}"; do
+      wait "$p" || true
+    done
+  fi
 
   # Per-family success counts.
   local codex_succeeded=0 codex_failed=0
@@ -1995,9 +2022,13 @@ run_cross_family_verifier() {
       pids=()
     fi
   done
-  for p in "${pids[@]}"; do
-    wait "$p" || true
-  done
+  # Guard empty-array drain: macOS bash 3.2 + set -u treats ${pids[@]} on an
+  # empty array as unbound. Fires when the chunk reviewers produced 0 findings.
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    for p in "${pids[@]}"; do
+      wait "$p" || true
+    done
+  fi
 
   # Merge step: walk the raw findings, attach the verdict, apply routing.
   echo "Merging verifier verdicts into final findings list..." >&2
@@ -2581,12 +2612,22 @@ main() {
     printf '[]' > "$WORK_DIR/det-findings.json"
   fi
 
-  # Route: single review vs chunked review
-  if [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
-    echo "Diff is $diff_lines lines (within chunk size $CHUNK_SIZE), using single review." >&2
+  # Route: chunked path is the v2 default — it gives the full dual-family
+  # (Codex + Claude) review and cross-family verifier, even on 1-chunk diffs.
+  # The v1 single-review path stays as a graceful-degradation fallback when
+  # v2 dual-family is unavailable (claude CLI missing, or --no-verify).
+  if v2_dual_family_enabled; then
+    if [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
+      echo "Diff is $diff_lines lines; using v2 dual-family review (Codex + Claude in parallel)." >&2
+    else
+      echo "Diff is $diff_lines lines (exceeds chunk size $CHUNK_SIZE); using v2 dual-family chunked review." >&2
+    fi
+    run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff_file" "$project_rules" "$followup_context" "$manifest_file"
+  elif [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
+    echo "Diff is $diff_lines lines and v2 dual-family unavailable; using v1 single review (Codex-only)." >&2
     run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff_file" "$project_rules" "$followup_context" "$manifest_file"
   else
-    echo "Diff is $diff_lines lines (exceeds chunk size $CHUNK_SIZE), using chunked review." >&2
+    echo "Diff is $diff_lines lines and v2 dual-family unavailable; using v1 chunked review (Codex-only fan-out)." >&2
     run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff_file" "$project_rules" "$followup_context" "$manifest_file"
   fi
 
@@ -2632,17 +2673,26 @@ main() {
   local comment
   comment=$(format_comment "$WORK_DIR/codex-output.json" "$pr_url" "$review_iteration" "$head_sha")
 
-  echo "Posting review to PR #$pr_number..." >&2
   echo "$comment" > "$WORK_DIR/pr-comment.md"
-  if ! gh pr comment "$pr_number" --body-file "$WORK_DIR/pr-comment.md" 2>"$WORK_DIR/gh-stderr.log"; then
-    echo "Error: Failed to post PR comment." >&2
-    if [[ -f "$WORK_DIR/gh-stderr.log" ]]; then
-      cat "$WORK_DIR/gh-stderr.log" >&2
-    fi
-    # Still output the comment so the user can see it
-    echo "--- Review output (not posted) ---"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local dry_run_path="/tmp/codex-pr-review-dry-run-pr${pr_number}-$(date -u +%Y%m%dT%H%M%SZ).md"
+    cp "$WORK_DIR/pr-comment.md" "$dry_run_path"
+    echo "Dry-run: rendered review NOT posted to PR #$pr_number." >&2
+    echo "Dry-run: comment body saved to $dry_run_path" >&2
+    echo "--- Review output (dry-run, not posted) ---"
     echo "$comment"
-    exit 4
+  else
+    echo "Posting review to PR #$pr_number..." >&2
+    if ! gh pr comment "$pr_number" --body-file "$WORK_DIR/pr-comment.md" 2>"$WORK_DIR/gh-stderr.log"; then
+      echo "Error: Failed to post PR comment." >&2
+      if [[ -f "$WORK_DIR/gh-stderr.log" ]]; then
+        cat "$WORK_DIR/gh-stderr.log" >&2
+      fi
+      # Still output the comment so the user can see it
+      echo "--- Review output (not posted) ---"
+      echo "$comment"
+      exit 4
+    fi
   fi
 
   # Output summary JSON for Claude to parse (v2: adds verdict mapped to v2
@@ -2712,7 +2762,11 @@ main() {
       delta: $delta
     }'
 
-  echo "Review posted to $pr_url" >&2
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "Dry-run complete (no comment posted to $pr_url)." >&2
+  else
+    echo "Review posted to $pr_url" >&2
+  fi
 }
 
 main

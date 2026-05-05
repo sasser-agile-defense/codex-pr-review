@@ -49,24 +49,24 @@
           "source": {
             "type": "string",
             "enum": ["codex", "claude", "deterministic"],
-            "description": "v2: which reviewer produced this finding. Optional; absent in v1 outputs."
+            "description": "v2: which reviewer produced this finding. Chunk reviewers set 'codex' or 'claude'; deterministic floor sets 'deterministic'."
           },
           "verifier_verdict": {
             "type": "string",
             "enum": ["confirmed", "refuted", "inconclusive", "n/a"],
-            "description": "v2: cross-family verifier verdict on this finding. Optional; absent in v1 outputs."
+            "description": "v2: cross-family verifier verdict. Chunk reviewers MUST set 'n/a' (placeholder); the cross-family verifier overwrites this downstream."
           },
           "agreement": {
             "type": "string",
             "enum": ["both", "codex-only", "claude-only", "deterministic", "unconfirmed-by-codex", "unconfirmed-by-claude"],
-            "description": "v2: agreement / confidence label rendered alongside the finding. Optional; absent in v1 outputs."
+            "description": "v2: agreement label. Chunk reviewers MUST set 'codex-only' or 'claude-only' matching their source (placeholder); the merge step overwrites to 'both' when both families flag the same issue."
           },
           "suggested_fix": {
             "type": "string",
             "description": "v2 P5: 1–3 sentence fix recommendation. Required in v2 synthesis output. Full code only when the change is < 5 lines."
           }
         },
-        "required": ["title", "body", "confidence_score", "priority", "code_location", "status", "suggested_fix"],
+        "required": ["title", "body", "confidence_score", "priority", "code_location", "status", "suggested_fix", "source", "verifier_verdict", "agreement"],
         "additionalProperties": false
       }
     },
@@ -95,8 +95,8 @@
       "description": "Titles of prior review findings that have been resolved. Empty array for initial reviews."
     },
     "iteration_meta": {
-      "type": "object",
-      "description": "v2: metadata about the iteration (mode, prior_sha, delta block). Optional; absent in v1 outputs.",
+      "type": ["object", "null"],
+      "description": "v2: metadata about the iteration (mode, prior_sha, delta block). Chunk reviewers MUST emit null; review.sh and the synthesizer populate it downstream.",
       "properties": {
         "iteration": {
           "type": "integer",
@@ -112,7 +112,7 @@
           "description": "SHA of the head commit at the prior review, if known."
         },
         "delta": {
-          "type": "object",
+          "type": ["object", "null"],
           "properties": {
             "resolved": {"type": "array", "items": {"type": "string"}},
             "persisting": {"type": "array", "items": {"type": "string"}},
@@ -123,21 +123,22 @@
           "additionalProperties": false
         }
       },
-      "required": ["iteration", "mode"],
+      "required": ["iteration", "mode", "prior_sha", "delta"],
       "additionalProperties": false
     },
     "delta": {
-      "type": "object",
-      "description": "v2 P5: top-level delta block for follow-up runs. Mirrors iteration_meta.delta when populated. Optional; absent in initial-mode outputs.",
+      "type": ["object", "null"],
+      "description": "v2 P5: top-level delta block for follow-up runs. Mirrors iteration_meta.delta when populated. Chunk reviewers MUST emit null. Each array holds finding titles (strings).",
       "properties": {
-        "resolved": {"type": "array"},
-        "persisting": {"type": "array"},
-        "new": {"type": "array"},
-        "regressed": {"type": "array"}
+        "resolved": {"type": "array", "items": {"type": "string"}},
+        "persisting": {"type": "array", "items": {"type": "string"}},
+        "new": {"type": "array", "items": {"type": "string"}},
+        "regressed": {"type": "array", "items": {"type": "string"}}
       },
+      "required": ["resolved", "persisting", "new", "regressed"],
       "additionalProperties": false
     }
   },
-  "required": ["findings", "overall_correctness", "overall_explanation", "overall_confidence_score", "review_iteration", "resolved_prior_findings"],
+  "required": ["findings", "overall_correctness", "overall_explanation", "overall_confidence_score", "review_iteration", "resolved_prior_findings", "iteration_meta", "delta"],
   "additionalProperties": false
 }

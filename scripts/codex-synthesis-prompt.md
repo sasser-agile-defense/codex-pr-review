@@ -59,9 +59,13 @@ You have exactly five tasks. Do not perform any task outside this list.
 
 The prompt may include a `## Prior Review Context` section indicating the iteration mode (`initial`, `followup-after-fixes`, or `delta-since-prior`).
 
-- **`initial`** — omit the `iteration_meta` and `delta` blocks (the schema makes them optional for initial mode).
-- **`followup-after-fixes`** — populate `iteration_meta` with `{iteration, mode: "followup-after-fixes", prior_sha}` and emit a top-level `delta` object with `resolved`, `persisting`, `new`, `regressed` arrays. `resolved` lists prior findings no longer present. `persisting` lists prior findings still present (status="persisting"). `new` lists newly-introduced findings (status="new"). `regressed` is reserved for prior findings that were marked resolved earlier but came back; usually empty here.
-- **`delta-since-prior`** — populate `iteration_meta` with `{iteration, mode: "delta-since-prior", prior_sha, delta: {...}}` and the matching top-level `delta` object. The diff you see is the *delta diff* (commits since the prior SHA), not the full PR diff. For each prior finding, decide if it is `resolved`, `persisting`, or `regressed`. Findings introduced by the delta commits go in `new`.
+Both `iteration_meta` and the top-level `delta` are required by the schema; emit `null` (not omit) when they don't apply, and emit a populated object otherwise.
+
+- **`initial`** — emit `"iteration_meta": null` and `"delta": null`.
+- **`followup-after-fixes`** — populate `iteration_meta` with `{iteration, mode: "followup-after-fixes", prior_sha, delta: {...}}` and mirror the same `delta` object at the top level. `delta` has four required arrays: `resolved` (prior findings no longer present), `persisting` (prior findings still present, status="persisting"), `new` (newly-introduced findings, status="new"), `regressed` (prior findings marked resolved earlier that came back; usually empty here).
+- **`delta-since-prior`** — populate `iteration_meta` with `{iteration, mode: "delta-since-prior", prior_sha, delta: {...}}` and mirror the same `delta` object at the top level. The diff you see is the *delta diff* (commits since the prior SHA), not the full PR diff. For each prior finding, decide if it is `resolved`, `persisting`, or `regressed`. Findings introduced by the delta commits go in `new`.
+
+When you populate `iteration_meta`, remember it requires all four sub-fields: `iteration`, `mode`, `prior_sha`, and `delta`. Set `prior_sha` to `""` if unknown. Set `delta` inside `iteration_meta` to `null` only if you cannot compute it.
 
 ## Repository Access
 

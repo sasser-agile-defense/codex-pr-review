@@ -125,6 +125,11 @@ MODEL_CLAUDE="claude-opus-4-7"
 # v2 additions (P2):
 MODEL_VERIFIER="claude-haiku-4-5"   # default cross-family verifier model
 
+# v2 additions (P3): deterministic floor (lint/typecheck/tests on changed
+# lines). Enabled by default; --no-deterministic disables it. The flag is
+# wired through to det-floor.sh via the NO_DETERMINISTIC env var.
+NO_DETERMINISTIC="false"
+
 # v2 additions (P4):
 MODE="auto"   # auto | initial | followup | delta — iteration mode override
 
@@ -181,6 +186,10 @@ while [[ $# -gt 0 ]]; do
       VERIFY_ENABLED="false"
       shift
       ;;
+    --no-deterministic)
+      NO_DETERMINISTIC="true"
+      shift
+      ;;
     --mode)
       case "$2" in
         auto|initial|followup|delta) MODE="$2" ;;
@@ -204,6 +213,7 @@ Options:
   --chunk-size N         Lines per chunk (default 3000)
   --max-parallel N       Concurrent slots during chunked review (default 4; each slot runs Codex+Claude in parallel)
   --no-verify            Skip the cross-family verifier (debug only)
+  --no-deterministic     Skip the deterministic lint/typecheck/test floor
   --mode MODE            auto | initial | followup | delta (default auto)
   -h, --help             Show this help and exit
 USAGE
@@ -1085,11 +1095,26 @@ build_synthesis_prompt() {
   local line_num
   line_num=$(grep -n '{{CHUNK_RESULTS}}' "$WORK_DIR/_synthesis_template.md" | head -1 | cut -d: -f1)
   if [[ -n "$line_num" ]]; then
-    head -n "$((line_num - 1))" "$WORK_DIR/_synthesis_template.md" > "$WORK_DIR/_synthesis_pre_diff.md"
-    cat "$chunk_results_file" >> "$WORK_DIR/_synthesis_pre_diff.md"
-    tail -n "+$((line_num + 1))" "$WORK_DIR/_synthesis_template.md" >> "$WORK_DIR/_synthesis_pre_diff.md"
+    head -n "$((line_num - 1))" "$WORK_DIR/_synthesis_template.md" > "$WORK_DIR/_synthesis_pre_det.md"
+    cat "$chunk_results_file" >> "$WORK_DIR/_synthesis_pre_det.md"
+    tail -n "+$((line_num + 1))" "$WORK_DIR/_synthesis_template.md" >> "$WORK_DIR/_synthesis_pre_det.md"
   else
-    cp "$WORK_DIR/_synthesis_template.md" "$WORK_DIR/_synthesis_pre_diff.md"
+    cp "$WORK_DIR/_synthesis_template.md" "$WORK_DIR/_synthesis_pre_det.md"
+  fi
+
+  # Splice deterministic findings at {{DET_FINDINGS}} (P3). Empty array → "[]"
+  # so the model still sees the surrounding fenced JSON block consistently.
+  local det_line_num det_findings_text="[]"
+  if [[ -f "$WORK_DIR/det-findings.json" ]] && jq empty "$WORK_DIR/det-findings.json" 2>/dev/null; then
+    det_findings_text=$(jq '.' "$WORK_DIR/det-findings.json" 2>/dev/null || echo "[]")
+  fi
+  det_line_num=$(grep -n '{{DET_FINDINGS}}' "$WORK_DIR/_synthesis_pre_det.md" | head -1 | cut -d: -f1)
+  if [[ -n "$det_line_num" ]]; then
+    head -n "$((det_line_num - 1))" "$WORK_DIR/_synthesis_pre_det.md" > "$WORK_DIR/_synthesis_pre_diff.md"
+    printf '%s\n' "$det_findings_text" >> "$WORK_DIR/_synthesis_pre_diff.md"
+    tail -n "+$((det_line_num + 1))" "$WORK_DIR/_synthesis_pre_det.md" >> "$WORK_DIR/_synthesis_pre_diff.md"
+  else
+    cp "$WORK_DIR/_synthesis_pre_det.md" "$WORK_DIR/_synthesis_pre_diff.md"
   fi
 
   # Decide whether to inline the raw diff or substitute a pointer sentence.
@@ -1509,6 +1534,36 @@ run_chunked_review() {
     exit 3
   fi
 
+  # ─── Drain deterministic floor and merge into synthesis input (P3) ────────
+  # det-floor.sh runs in parallel with the LLM fan-out. Wait for it now (it is
+  # almost certainly already done). Merge its findings into merged-findings.json
+  # so synthesis sees the full picture: pre-verified LLM findings plus the
+  # tool-grounded deterministic findings. Dedup on finding_id (file|start|title)
+  # to avoid double-counting if a deterministic finding happens to match an LLM
+  # finding's location and title verbatim. Deterministic wins on dedup.
+  if [[ -n "${DET_FLOOR_PID:-}" ]]; then
+    wait "$DET_FLOOR_PID" 2>/dev/null || true
+  fi
+  local det_file="$WORK_DIR/det-findings.json"
+  if [[ -f "$det_file" ]] && jq empty "$det_file" 2>/dev/null; then
+    local det_count
+    det_count=$(jq 'length' "$det_file")
+    if [[ "$det_count" -gt 0 ]]; then
+      echo "Merging $det_count deterministic findings into synthesis input..." >&2
+      local combined_file="$WORK_DIR/merged-findings-with-det.json"
+      jq -s '
+        def keyof(f): (f.code_location.path // "") + "|" + ((f.code_location.start_line // 0)|tostring) + "|" + (f.title // "");
+        # .[0] = LLM merged-findings, .[1] = deterministic findings.
+        # Deterministic findings come first (so they sort above LLM at equal
+        # priority in format_comment); dedup keeps the deterministic version
+        # when both an LLM and a deterministic finding share the same key.
+        (.[1] + .[0])
+        | unique_by(keyof(.))
+      ' "$merged_file" "$det_file" > "$combined_file"
+      mv "$combined_file" "$merged_file"
+    fi
+  fi
+
   # Build chunk results JSON array consumed by synthesis. Now feeds the
   # post-verifier merged finding list (one synthetic chunk wrapper) instead of
   # the raw per-chunk results array.
@@ -1757,6 +1812,16 @@ run_cross_family_verifier() {
       jq empty "$f" 2>/dev/null || continue
       while IFS= read -r finding; do
         [[ -z "$finding" || "$finding" == "null" ]] && continue
+        # P3 guard: if a chunk output somehow contains a `source: deterministic`
+        # finding, skip verification — deterministic findings are grounded in
+        # tool exit codes, not LLM inference, and re-verifying them would just
+        # waste a verifier slot. They're spliced back in post-verifier from
+        # det-findings.json, so dropping them here is safe.
+        local existing_source
+        existing_source=$(printf '%s' "$finding" | jq -r '.source // ""')
+        if [[ "$existing_source" == "deterministic" ]]; then
+          continue
+        fi
         if [[ "$first" == "true" ]]; then
           first=false
         else
@@ -2037,6 +2102,54 @@ run_cross_family_verifier() {
   return 0
 }
 
+# ─── Merge deterministic findings into final output (v2 P3) ─────────────────
+# Run from main() after the LLM pipeline finishes (single or chunked) and
+# before format_comment. Reads $det_file (a JSON array conforming to
+# det-output-schema.json), reads $output_file (the synthesis or single-review
+# output, conforming to codex-output-schema.json), and writes back to
+# $output_file with deterministic findings appended to .findings[]. Dedups on
+# (file|start_line|title); deterministic wins. No-op if det_file is missing or
+# empty.
+#
+# In the chunked path, deterministic findings are *also* fed into the synthesis
+# input (via merged-findings.json). This second merge here exists so the
+# single-review path (which has no synthesis) and any synthesis output that
+# accidentally drops deterministic findings still surface them in the final
+# PR comment.
+merge_det_into_output() {
+  local output_file="$1"
+  local det_file="$2"
+
+  [[ -f "$output_file" ]] || return 0
+  [[ -f "$det_file" ]] || return 0
+  jq empty "$output_file" 2>/dev/null || return 0
+  jq empty "$det_file" 2>/dev/null || return 0
+
+  local det_count
+  det_count=$(jq 'length' "$det_file" 2>/dev/null || echo 0)
+  if [[ "$det_count" -eq 0 ]]; then
+    return 0
+  fi
+
+  # The codex-output-schema requires `status` on every finding; deterministic
+  # findings produced by det-floor.sh do not have it (det-output-schema.json
+  # does not include status). Inject status="new" during the merge.
+  local merged_tmp="$WORK_DIR/_codex-output-merged.json"
+  jq --slurpfile det "$det_file" '
+    def keyof(f): (f.code_location.path // "") + "|" + ((f.code_location.start_line // 0)|tostring) + "|" + (f.title // "");
+    . as $root
+    | ($det[0] | map(. + {status: "new"})) as $detF
+    | ($detF + ($root.findings // [])) as $combined
+    | $combined | unique_by(keyof(.)) as $deduped
+    | $root | .findings = $deduped
+  ' "$output_file" > "$merged_tmp" 2>/dev/null || return 0
+
+  if jq empty "$merged_tmp" 2>/dev/null; then
+    mv "$merged_tmp" "$output_file"
+    echo "Merged $det_count deterministic finding(s) into $(basename "$output_file")." >&2
+  fi
+}
+
 # ─── Format Comment ──────────────────────────────────────────────────────────
 format_comment() {
   local output_file="$1"
@@ -2169,7 +2282,17 @@ format_comment() {
       fi
 
       comment+="| $idx | $priority_label | $display_title | $location | $conf |"$'\n'
-    done < <(jq -c --arg t "$THRESHOLD" '.findings[] | select(.confidence_score >= ($t | tonumber))' "$output_file" | jq -c '.' | sort -t: -k1 -rn 2>/dev/null || cat)
+    done < <(jq -c --arg t "$THRESHOLD" '
+      # P3 sort: priority desc → deterministic findings first within each
+      # priority bucket → title alphabetical (stable tiebreaker).
+      [.findings[] | select(.confidence_score >= ($t | tonumber))]
+      | sort_by([
+          -((.priority // 0)),
+          (if (.source // "") == "deterministic" then 0 else 1 end),
+          (.title // "")
+        ])
+      | .[]
+    ' "$output_file")
 
     comment+=$'\n'
     comment+="<details><summary>Detailed findings</summary>"$'\n\n'
@@ -2218,7 +2341,15 @@ format_comment() {
       comment+="\`${path}:${start_line}-${end_line}\`"$'\n\n'
       comment+="> $body"$'\n\n'
       comment+="---"$'\n\n'
-    done < <(jq -c --arg t "$THRESHOLD" '.findings[] | select(.confidence_score >= ($t | tonumber))' "$output_file")
+    done < <(jq -c --arg t "$THRESHOLD" '
+      [.findings[] | select(.confidence_score >= ($t | tonumber))]
+      | sort_by([
+          -((.priority // 0)),
+          (if (.source // "") == "deterministic" then 0 else 1 end),
+          (.title // "")
+        ])
+      | .[]
+    ' "$output_file")
 
     comment+="</details>"$'\n\n'
   fi
@@ -2457,6 +2588,30 @@ main() {
   local manifest_file="$WORK_DIR/manifest.md"
   build_plan_and_manifest "$diff_file" "$manifest_file"
 
+  # ─── Launch deterministic floor (P3) ──────────────────────────────────────
+  # det-floor.sh runs lint/typecheck/tests on the diff-touched lines and writes
+  # $WORK_DIR/det-findings.json. It runs in parallel with the LLM fan-out so it
+  # does not sit on the critical path. We drain it before synthesis (chunked
+  # path inside run_chunked_review) and again before format_comment (covers
+  # the single-review path which has no synthesis). The output schema matches
+  # the v2 finding shape; merge_det_into_output() splices results into
+  # codex-output.json so format_comment renders them with the [deterministic]
+  # badge.
+  local det_repo_root
+  det_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+  local det_pid=""
+  if [[ -x "$SCRIPT_DIR/det-floor.sh" ]]; then
+    NO_DETERMINISTIC="$NO_DETERMINISTIC" \
+      bash "$SCRIPT_DIR/det-floor.sh" "$WORK_DIR" "$det_repo_root" "$diff_file" \
+      >>"$WORK_DIR/det-floor-stdout.log" 2>>"$WORK_DIR/det-floor-stderr-launcher.log" &
+    det_pid=$!
+    DET_FLOOR_PID="$det_pid"
+    export DET_FLOOR_PID
+  else
+    echo "Note: det-floor.sh not found at $SCRIPT_DIR/det-floor.sh; skipping deterministic floor." >&2
+    printf '[]' > "$WORK_DIR/det-findings.json"
+  fi
+
   # Route: single review vs chunked review
   if [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
     echo "Diff is $diff_lines lines (within chunk size $CHUNK_SIZE), using single review." >&2
@@ -2465,6 +2620,15 @@ main() {
     echo "Diff is $diff_lines lines (exceeds chunk size $CHUNK_SIZE), using chunked review." >&2
     run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff_file" "$project_rules" "$followup_context" "$manifest_file"
   fi
+
+  # Drain the deterministic floor (it should be done long before now, but be
+  # explicit). Then splice its findings into codex-output.json so format_comment
+  # renders them with the [deterministic] badge. Failures here are non-fatal —
+  # an empty det-findings.json yields a no-op merge.
+  if [[ -n "$det_pid" ]]; then
+    wait "$det_pid" 2>/dev/null || true
+  fi
+  merge_det_into_output "$WORK_DIR/codex-output.json" "$WORK_DIR/det-findings.json"
 
   # Format and post (same for both paths — both produce codex-output.json)
   echo "Formatting results..." >&2

@@ -1,0 +1,26 @@
+[
+  {
+    "code": "F401",
+    "message": "`os` imported but unused",
+    "filename": "src/example.py",
+    "location": {"row": 10, "column": 1},
+    "end_location": {"row": 10, "column": 12},
+    "fix": null
+  },
+  {
+    "code": "E501",
+    "message": "Line too long (130 > 100 characters)",
+    "filename": "src/example.py",
+    "location": {"row": 25, "column": 5},
+    "end_location": {"row": 25, "column": 130},
+    "fix": null
+  },
+  {
+    "code": "W291",
+    "message": "Trailing whitespace",
+    "filename": "src/example.py",
+    "location": {"row": 42, "column": 9},
+    "end_location": {"row": 42, "column": 11},
+    "fix": null
+  }
+]

@@ -10,6 +10,16 @@ The following JSON array contains the review output from each chunk. In v2 (P2+)
 {{CHUNK_RESULTS}}
 ```
 
+## Deterministic Tool Findings
+
+These findings come from static analysis tools (linters, type checkers). They are grounded in tool exit codes, not model inference. Do not drop or downgrade them during synthesis. Merge them into the final findings list with `source: 'deterministic'` and `agreement: 'deterministic'` preserved.
+
+If the section below is empty (no tools configured, or none produced findings on changed lines), handle as an empty section and proceed using only the LLM findings above.
+
+```json
+{{DET_FINDINGS}}
+```
+
 ## Synthesis Instructions
 
 1. **Merge findings** — Combine all findings from all chunks into a single findings list.

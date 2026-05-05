@@ -1,0 +1,73 @@
+{
+  "$comment": "v2 P3: schema for $WORK_DIR/det-findings.json. Each finding is grounded in a static-analysis tool exit code (lint/typecheck/test) on a diff-touched line. Findings skip the cross-family verifier (already grounded in tool output, not model inference). source/agreement/verifier_verdict are pinned constants.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Short title summarizing the issue (keep under 80 chars)."
+      },
+      "body": {
+        "type": "string",
+        "description": "Detailed explanation including the tool name and raw message."
+      },
+      "code_location": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative file path from repo root."
+          },
+          "start_line": {
+            "type": "integer",
+            "description": "Starting line number of the issue."
+          },
+          "end_line": {
+            "type": "integer",
+            "description": "Ending line number of the issue."
+          }
+        },
+        "required": ["path", "start_line", "end_line"],
+        "additionalProperties": false
+      },
+      "priority": {
+        "type": "integer",
+        "description": "0=info, 1=low (lint warn), 2=medium (lint err / type err), 3=high (test failure)."
+      },
+      "confidence_score": {
+        "type": "number",
+        "description": "Always 1.0 for deterministic findings (tool exit code is full evidence)."
+      },
+      "category": {
+        "type": "string",
+        "enum": ["correctness", "security", "performance", "maintainability", "style"],
+        "description": "Coarse category. type/test errors → correctness; lint warnings → style."
+      },
+      "source": {
+        "type": "string",
+        "const": "deterministic"
+      },
+      "verifier_verdict": {
+        "type": "string",
+        "const": "n/a"
+      },
+      "agreement": {
+        "type": "string",
+        "const": "deterministic"
+      }
+    },
+    "required": [
+      "title",
+      "body",
+      "code_location",
+      "priority",
+      "confidence_score",
+      "category",
+      "source",
+      "verifier_verdict",
+      "agreement"
+    ],
+    "additionalProperties": false
+  }
+}

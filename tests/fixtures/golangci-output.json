@@ -1,0 +1,31 @@
+{
+  "Issues": [
+    {
+      "FromLinter": "ineffassign",
+      "Text": "ineffectual assignment to err",
+      "Severity": "",
+      "SourceLines": ["\terr = doThing()"],
+      "Pos": {
+        "Filename": "internal/handler.go",
+        "Offset": 0,
+        "Line": 42,
+        "Column": 2
+      }
+    },
+    {
+      "FromLinter": "errcheck",
+      "Text": "Error return value of `f.Close` is not checked",
+      "Severity": "",
+      "SourceLines": ["\tf.Close()"],
+      "Pos": {
+        "Filename": "internal/handler.go",
+        "Offset": 0,
+        "Line": 88,
+        "Column": 2
+      }
+    }
+  ],
+  "Report": {
+    "Linters": []
+  }
+}

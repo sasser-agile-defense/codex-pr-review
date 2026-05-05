@@ -1,0 +1,33 @@
+[
+  {
+    "filePath": "src/handler.ts",
+    "messages": [
+      {
+        "ruleId": "no-unused-vars",
+        "severity": 2,
+        "message": "'helper' is defined but never used.",
+        "line": 15,
+        "column": 7,
+        "nodeType": "Identifier",
+        "messageId": "unusedVar",
+        "endLine": 15,
+        "endColumn": 13
+      },
+      {
+        "ruleId": "prefer-const",
+        "severity": 1,
+        "message": "'count' is never reassigned. Use 'const' instead.",
+        "line": 28,
+        "column": 5,
+        "nodeType": "VariableDeclaration",
+        "endLine": 28,
+        "endColumn": 22
+      }
+    ],
+    "errorCount": 1,
+    "warningCount": 1,
+    "fixableErrorCount": 0,
+    "fixableWarningCount": 1,
+    "source": ""
+  }
+]

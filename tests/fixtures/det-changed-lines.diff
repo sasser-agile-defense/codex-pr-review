@@ -1,0 +1,10 @@
+diff --git a/src/example.py b/src/example.py
+index abc1234..def5678 100644
+--- a/src/example.py
++++ b/src/example.py
+@@ -10,1 +10,1 @@
+-import sys
++import os
+@@ -25,1 +25,1 @@
+-x = 1
++x = "this is a really long line that exceeds limit and triggers ruff E501 here"

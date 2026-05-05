@@ -1,0 +1,4 @@
+src/example.py:10:1: F401 [*] `os` imported but unused
+src/example.py:25:5: E501 Line too long (130 > 100 characters)
+src/example.py:42:9: W291 Trailing whitespace
+Found 3 errors.

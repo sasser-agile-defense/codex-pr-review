@@ -1,0 +1,3 @@
+# Marker for an intentionally-empty repo fixture used by tests/test-det-floor.sh.
+# A directory with no pyproject.toml, .eslintrc.*, .golangci.yml, tsconfig.json,
+# and no .codex-pr-review.toml. Asserts the silent-skip path emits [].

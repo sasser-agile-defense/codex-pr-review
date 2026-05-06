@@ -43,6 +43,7 @@ Every finding you produce **must** include the following fields exactly:
 - `"verifier_verdict": "n/a"` — placeholder; the cross-family verifier overwrites this downstream. Always emit `"n/a"`.
 - `"agreement": "claude-only"` — placeholder; the merge step promotes this to `"both"` when Codex flags the same issue. Always emit `"claude-only"` here.
 - `"original_confidence_score": null` — placeholder; the verifier merge populates it. Always emit `null` here.
+- `"verifier_evidence": null` — placeholder; the verifier merge populates it from the verifier's response. Always emit `null` here.
 
 At the top level of your response object, also emit:
 - `"iteration_meta": null`

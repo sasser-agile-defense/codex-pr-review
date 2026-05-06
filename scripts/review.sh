@@ -2056,9 +2056,11 @@ run_cross_family_verifier() {
     local verdict_file="$WORK_DIR/verifier/finding-${fid}-verdict.json"
     local verdict="inconclusive"
     local adjusted_conf="0.0"
+    local verifier_evidence=""
     if [[ -f "$verdict_file" ]] && jq empty "$verdict_file" 2>/dev/null; then
       verdict=$(jq -r '.verdict // "inconclusive"' "$verdict_file")
       adjusted_conf=$(jq -r '.adjusted_confidence // 0.0' "$verdict_file")
+      verifier_evidence=$(jq -r '.evidence // ""' "$verdict_file")
     fi
 
     if [[ "$verdict" == "refuted" ]]; then
@@ -2112,6 +2114,7 @@ run_cross_family_verifier() {
     printf '%s' "$finding" \
       | jq -c --arg verdict "$verdict" \
              --arg agreement "$agreement" \
+             --arg evidence "$verifier_evidence" \
              --argjson adjconf "$adjusted_conf" \
         '
           . as $f
@@ -2126,6 +2129,7 @@ run_cross_family_verifier() {
              else (.priority // 0) end) as $new_priority
           | $f
           | .verifier_verdict          = $verdict
+          | .verifier_evidence         = (if $evidence == "" then null else $evidence end)
           | .agreement                 = $agreement
           | .confidence_score          = $new_conf
           | .original_confidence_score = $orig_conf
@@ -2303,6 +2307,7 @@ format_comment() {
 
     while IFS= read -r finding; do
       local title body priority path start_line end_line status agreement source verifier_verdict suggested_fix
+      local verifier_evidence
       title=$(echo "$finding" | jq -r '.title // ""')
       body=$(echo "$finding" | jq -r '.body // ""')
       priority=$(echo "$finding" | jq -r '.priority // 0')
@@ -2313,6 +2318,7 @@ format_comment() {
       agreement=$(echo "$finding" | jq -r '.agreement // ""')
       source=$(echo "$finding" | jq -r '.source // ""')
       verifier_verdict=$(echo "$finding" | jq -r '.verifier_verdict // ""')
+      verifier_evidence=$(echo "$finding" | jq -r '.verifier_evidence // ""')
       suggested_fix=$(echo "$finding" | jq -r '.suggested_fix // ""')
 
       # Agreement badges. Multiple badges are allowed but the verifier flow
@@ -2360,6 +2366,22 @@ format_comment() {
       local body_quoted
       body_quoted=$(printf '%s' "$body" | sed 's/^/> /')
       comment+="${body_quoted}"$'\n'
+      # Surface the verifier's reasoning for unconfirmed findings so reviewers
+      # can see why the cross-family verifier hedged. Confirmed findings
+      # already carry the [both] / [<source>-only] badge as the signal.
+      if [[ "$verifier_verdict" == "inconclusive" && -n "$verifier_evidence" && "$verifier_evidence" != "null" ]]; then
+        local verifier_who
+        case "$agreement" in
+          unconfirmed-by-codex)  verifier_who="$MODEL_VERIFIER (codex-side)" ;;
+          unconfirmed-by-claude) verifier_who="$MODEL_VERIFIER (claude-side)" ;;
+          *)                     verifier_who="verifier" ;;
+        esac
+        local evidence_quoted
+        evidence_quoted=$(printf '%s' "$verifier_evidence" | sed 's/^/> /')
+        comment+=">"$'\n'
+        comment+="> *Verifier ($verifier_who) marked inconclusive:*"$'\n'
+        comment+="${evidence_quoted}"$'\n'
+      fi
       comment+=">"$'\n'
       if [[ -n "$suggested_fix" && "$suggested_fix" != "null" ]]; then
         comment+="> **Suggested fix:** ${suggested_fix}"$'\n'

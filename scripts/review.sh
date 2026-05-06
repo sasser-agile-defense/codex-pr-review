@@ -14,9 +14,19 @@ FAILURE_DIR=""   # populated by preserve_chunk_failures when there are any
 
 cleanup_work_dir() {
   preserve_chunk_failures
-  rm -rf "$WORK_DIR"
+  preserve_verifier_failures
+  # KEEP_WORKDIR=1 (env) suppresses the auto-cleanup so the full pipeline
+  # state (chunks/, verifier/, plan.json, codex-output.json, prompts) can be
+  # inspected after the run. Used for debugging verifier subprocess failures
+  # and synthesis behavior. Always echoes the path so the user knows where it
+  # is. CI defaults to cleaned-up runs; turn this on for diagnostic smoke runs.
+  if [[ "${KEEP_WORKDIR:-0}" == "1" ]]; then
+    echo "KEEP_WORKDIR=1: leaving work dir at $WORK_DIR for inspection." >&2
+  else
+    rm -rf "$WORK_DIR"
+  fi
   if [[ -n "$FAILURE_DIR" ]]; then
-    echo "Chunk failure diagnostics saved to: $FAILURE_DIR" >&2
+    echo "Failure diagnostics saved to: $FAILURE_DIR" >&2
   fi
 }
 
@@ -67,6 +77,43 @@ preserve_chunk_failures() {
       fi
       cp "$stderr_log" "$FAILURE_DIR/${failure_prefix}-stderr.log" 2>/dev/null || true
       [[ -f "$prompt_file" ]] && cp "$prompt_file" "$FAILURE_DIR/${failure_prefix}-prompt.md" 2>/dev/null || true
+    fi
+  done
+}
+
+# Mirror of preserve_chunk_failures for the cross-family verifier (v2 P2).
+# Triggered on every run; copies any verifier verdict file plus its stderr log
+# into FAILURE_DIR when the verdict file is missing/invalid OR carries the
+# synthetic "verifier subprocess failed" evidence string. Without this we lose
+# the per-finding stderr when WORK_DIR cleans up, which is exactly what made
+# the medsum#1 smoke debug-blind ("100% inconclusive" was actually 100%
+# subprocess failure).
+preserve_verifier_failures() {
+  [[ -d "$WORK_DIR/verifier" ]] || return 0
+  local verdict_file fid stderr_log
+  for verdict_file in "$WORK_DIR"/verifier/finding-*-verdict.json; do
+    [[ -f "$verdict_file" ]] || continue
+    fid="${verdict_file##*/finding-}"
+    fid="${fid%-verdict.json}"
+    stderr_log="$WORK_DIR/verifier/finding-${fid}-stderr.log"
+
+    local is_failure=0
+    if ! jq empty "$verdict_file" 2>/dev/null; then
+      is_failure=1
+    elif jq -e '.evidence | tostring | test("verifier subprocess failed")' "$verdict_file" >/dev/null 2>&1; then
+      is_failure=1
+    fi
+
+    if [[ "$is_failure" -eq 1 ]]; then
+      if [[ -z "$FAILURE_DIR" ]]; then
+        FAILURE_DIR="/tmp/codex-pr-review-failures-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        mkdir -p "$FAILURE_DIR"
+      fi
+      cp "$verdict_file" "$FAILURE_DIR/verifier-${fid}-verdict.json" 2>/dev/null || true
+      [[ -f "$stderr_log" ]] && cp "$stderr_log" "$FAILURE_DIR/verifier-${fid}-stderr.log" 2>/dev/null || true
+      # Also save the prompt that was sent so we can reproduce the call.
+      local prompt_file="$WORK_DIR/verifier/finding-${fid}-prompt.md"
+      [[ -f "$prompt_file" ]] && cp "$prompt_file" "$FAILURE_DIR/verifier-${fid}-prompt.md" 2>/dev/null || true
     fi
   done
 }
@@ -1275,14 +1322,19 @@ review_chunk_claude() {
       --allowedTools Read,Grep \
       --print \
       - < "$prompt_file" > "$output_file" 2>"$stderr_log"; then
-      # `--output-format json` wraps the structured output inside a CLI
-      # envelope (`{ "result": "<json string>", ... }`). Unwrap it; if the
-      # field is absent (older CLI build), fall back to using the raw stdout.
+      # `--output-format json` returns a CLI envelope. With `--json-schema`,
+      # the schema-conformant model output lives at `.structured_output` — NOT
+      # at `.result` (which is empty when the model emits structured output
+      # only, no conversational text). Older CLI builds put the JSON string at
+      # `.result`. Prefer `.structured_output`, fall back to `.result`, fall
+      # back to the raw envelope so we can still parse v1-shaped output.
       if jq empty "$output_file" 2>/dev/null; then
-        local result_field
-        result_field=$(jq -r 'if has("result") then .result else empty end' "$output_file" 2>/dev/null || true)
-        if [[ -n "$result_field" ]]; then
-          if printf '%s' "$result_field" | jq empty 2>/dev/null; then
+        if jq -e '.structured_output | type == "object"' "$output_file" >/dev/null 2>&1; then
+          jq '.structured_output' "$output_file" > "$output_file.tmp" && mv "$output_file.tmp" "$output_file"
+        else
+          local result_field
+          result_field=$(jq -r 'if has("result") then .result else empty end' "$output_file" 2>/dev/null || true)
+          if [[ -n "$result_field" ]] && printf '%s' "$result_field" | jq empty 2>/dev/null; then
             printf '%s' "$result_field" > "$output_file"
           fi
         fi
@@ -1691,11 +1743,22 @@ _run_claude_verifier() {
     --allowedTools Read,Grep \
     --print \
     - < "$prompt_file" > "$out_file" 2>"$stderr_log"; then
+    # With `--json-schema`, Claude CLI puts the schema-conformant output at
+    # `.structured_output`. `.result` is empty (or near-empty) when the model
+    # produced only structured output. Older CLI builds embed JSON in
+    # `.result` as a string. Prefer `.structured_output`; fall back to
+    # `.result`. This was the bug that caused 100% verifier subprocess
+    # failures on the medsum#1 smoke (every call appeared to succeed but the
+    # wrapper read the wrong field).
     if jq empty "$out_file" 2>/dev/null; then
-      local result_field
-      result_field=$(jq -r 'if has("result") then .result else empty end' "$out_file" 2>/dev/null || true)
-      if [[ -n "$result_field" ]] && printf '%s' "$result_field" | jq empty 2>/dev/null; then
-        printf '%s' "$result_field" > "$out_file"
+      if jq -e '.structured_output | type == "object"' "$out_file" >/dev/null 2>&1; then
+        jq '.structured_output' "$out_file" > "$out_file.tmp" && mv "$out_file.tmp" "$out_file"
+      else
+        local result_field
+        result_field=$(jq -r 'if has("result") then .result else empty end' "$out_file" 2>/dev/null || true)
+        if [[ -n "$result_field" ]] && printf '%s' "$result_field" | jq empty 2>/dev/null; then
+          printf '%s' "$result_field" > "$out_file"
+        fi
       fi
       if jq -e '.verdict and .evidence and (.adjusted_confidence != null)' "$out_file" >/dev/null 2>&1; then
         return 0
@@ -2043,6 +2106,9 @@ run_cross_family_verifier() {
   printf '[' > "$merged_file"
   local merged_first=true
   local refuted_count=0
+  local subprocess_failure_count=0
+  local confirmed_count=0
+  local inconclusive_count=0
   local total_count=0
 
   for ((idx=0; idx<raw_len; idx++)); do
@@ -2061,6 +2127,20 @@ run_cross_family_verifier() {
       verdict=$(jq -r '.verdict // "inconclusive"' "$verdict_file")
       adjusted_conf=$(jq -r '.adjusted_confidence // 0.0' "$verdict_file")
       verifier_evidence=$(jq -r '.evidence // ""' "$verdict_file")
+    fi
+
+    # Count outcomes for the runtime summary. The synthetic "verifier
+    # subprocess failed" evidence string (set when the Claude/Codex CLI call
+    # itself errored out, regardless of model verdict) is bucketed separately
+    # so the user sees the real failure rate instead of it being hidden
+    # inside "inconclusive". Aligns with what preserve_verifier_failures
+    # detects on cleanup.
+    case "$verdict" in
+      confirmed)    confirmed_count=$((confirmed_count + 1)) ;;
+      inconclusive) inconclusive_count=$((inconclusive_count + 1)) ;;
+    esac
+    if [[ "$verifier_evidence" == verifier\ subprocess\ failed* ]]; then
+      subprocess_failure_count=$((subprocess_failure_count + 1))
     fi
 
     if [[ "$verdict" == "refuted" ]]; then
@@ -2139,7 +2219,10 @@ run_cross_family_verifier() {
   done
   printf ']' >> "$merged_file"
 
-  echo "Cross-family verifier complete: $((total_count - refuted_count))/$total_count findings survived ($refuted_count refuted)." >&2
+  echo "Cross-family verifier complete: $((total_count - refuted_count))/$total_count findings survived (${confirmed_count} confirmed, ${inconclusive_count} inconclusive, ${refuted_count} refuted)." >&2
+  if [[ "$subprocess_failure_count" -gt 0 ]]; then
+    echo "  Warning: $subprocess_failure_count/$total_count verifier subprocesses failed (auth/timeout/parse) and were treated as inconclusive. Set KEEP_WORKDIR=1 and re-run, or check FAILURE_DIR after the run, for per-finding stderr." >&2
+  fi
 
   # If parsing fell apart, write a safe empty array so downstream code does
   # not crash.

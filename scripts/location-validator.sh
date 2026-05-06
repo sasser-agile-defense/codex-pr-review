@@ -144,7 +144,18 @@ while IFS= read -r f; do
     drop_missing_conf=$((drop_missing_conf + 1))
     continue
   fi
-  conf=$(printf '%s' "$f" | jq -r '.confidence_score')
+  # Prefer the pre-penalty `original_confidence_score` for threshold gating
+  # when present (set by the cross-family verifier merge for findings that
+  # received the inconclusive penalty). Falls back to `confidence_score` for
+  # confirmed findings, deterministic findings, and any v1-shaped output.
+  # Without this fallback, every inconclusive finding (post-penalty conf
+  # ≤ 0.7) is unwinnable against the default 0.8 threshold.
+  conf=$(printf '%s' "$f" | jq -r '
+    if has("original_confidence_score") and (.original_confidence_score != null)
+    then .original_confidence_score
+    else .confidence_score
+    end
+  ')
   # Numeric compare via awk for portability (bash can't compare floats).
   below=$(awk -v c="$conf" -v t="$THRESHOLD" 'BEGIN { print (c+0 < t+0) ? "1" : "0" }')
   if [[ "$below" == "1" ]]; then

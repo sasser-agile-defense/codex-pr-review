@@ -64,9 +64,13 @@
           "suggested_fix": {
             "type": "string",
             "description": "v2 P5: 1–3 sentence fix recommendation. Required in v2 synthesis output. Full code only when the change is < 5 lines."
+          },
+          "original_confidence_score": {
+            "type": ["number", "null"],
+            "description": "v2 post-fix: pre-penalty confidence score from the originating chunk reviewer. Set by the cross-family verifier merge so the threshold filter can use the un-penalized value while the displayed confidence_score still reflects the inconclusive penalty. Chunk reviewers MUST emit null; review.sh populates it downstream. May be null in v1 outputs flowing through the v2 path."
           }
         },
-        "required": ["title", "body", "confidence_score", "priority", "code_location", "status", "suggested_fix", "source", "verifier_verdict", "agreement"],
+        "required": ["title", "body", "confidence_score", "priority", "code_location", "status", "suggested_fix", "source", "verifier_verdict", "agreement", "original_confidence_score"],
         "additionalProperties": false
       }
     },

@@ -38,6 +38,7 @@ Every finding you produce **must** include the following fields exactly:
 - `"source": "codex"` — identifies you as the originating reviewer.
 - `"verifier_verdict": "n/a"` — placeholder; the cross-family verifier overwrites this downstream. Always emit `"n/a"`.
 - `"agreement": "codex-only"` — placeholder; the merge step promotes this to `"both"` when Claude flags the same issue. Always emit `"codex-only"` here.
+- `"original_confidence_score": null` — placeholder; the verifier merge populates it. Always emit `null` here.
 
 At the top level of your response object, also emit:
 - `"iteration_meta": null`

@@ -45,7 +45,7 @@ Review a pull request using a dual-family pipeline — Codex (`gpt-5.3-codex`) a
 | `--threshold` | `0.8` | Confidence threshold (post-verifier) |
 | `--model-codex` (alias `--model`) | `gpt-5.3-codex` | Codex reviewer model |
 | `--model-claude` | `claude-opus-4-7` | Claude reviewer + synthesizer model |
-| `--model-verifier` | `claude-haiku-4-5` | Default cross-family verifier model |
+| `--model-verifier` | `claude-opus-4-7` | Default cross-family verifier model. Override with `claude-haiku-4-5` for cheaper but more deferential verification |
 | `--chunker` | `auto` | `auto` (AST when language is supported, hunk fallback), `ast`, or `hunk` |
 | `--review-rules` | (auto) | Path to override REVIEW.md / CLAUDE.md discovery |
 | `--chunk-size` | `3000` | Lines per chunk |
@@ -70,7 +70,7 @@ PRs whose diff exceeds `--chunk-size` are split into chunks and reviewed in para
 
 - `[both]` — both Codex and Claude flagged it AND the cross-family verifier confirmed.
 - `[codex-only]` / `[claude-only]` — single-family finding that the other family's verifier confirmed.
-- `[unconfirmed-by-codex]` / `[unconfirmed-by-claude]` — verifier could not confirm or refute (inconclusive). These findings have their priority demoted by 1 and `confidence_score *= 0.7`.
+- `[unconfirmed-by-codex]` / `[unconfirmed-by-claude]` — verifier could not confirm or refute (inconclusive). These findings have their priority demoted by 1 and a 0.7× penalty applied to `confidence_score` for display, but the threshold filter checks the pre-penalty `original_confidence_score` so unconfirmed-but-high-confidence findings still surface.
 - `[deterministic]` — produced by lint / typecheck / test runs (skips verification because tools don't hallucinate).
 
 **Verdict enum (v2):**

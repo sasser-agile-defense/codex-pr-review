@@ -123,7 +123,13 @@ MODEL_CODEX="gpt-5.3-codex"
 MODEL_CLAUDE="claude-opus-4-7"
 
 # v2 additions (P2):
-MODEL_VERIFIER="claude-haiku-4-5"   # default cross-family verifier model
+MODEL_VERIFIER="claude-opus-4-7"    # default cross-family verifier model.
+# Spec §10 ("Verifier deference") originally proposed Haiku 4.5 with Opus 4.7
+# escalation on inconclusive verdicts. Live testing on a 35K-line PR showed
+# Haiku 4.5 returning 100% inconclusive (the deference failure mode in
+# reverse), which combined with the threshold filter to drop every unconfirmed
+# finding. Defaulting to Opus 4.7 trades cost for accuracy on the verifier
+# step. Override with --model-verifier claude-haiku-4-5 to revert.
 
 # v2 additions (P3): deterministic floor (lint/typecheck/tests on changed
 # lines). Enabled by default; --no-deterministic disables it. The flag is
@@ -215,7 +221,7 @@ Options:
   --model MODEL          Codex model (alias for --model-codex)
   --model-codex MODEL    Codex model (default gpt-5.3-codex)
   --model-claude MODEL   Claude model (default claude-opus-4-7)
-  --model-verifier MODEL Cross-family verifier model (default claude-haiku-4-5)
+  --model-verifier MODEL Cross-family verifier model (default claude-opus-4-7)
   --chunker MODE         auto | ast | hunk (default auto)
   --review-rules PATH    Path to REVIEW.md override (must exist)
   --max-diff-lines N     Truncate diff at N lines (0 = unlimited)
@@ -2096,6 +2102,13 @@ run_cross_family_verifier() {
       printf ',' >> "$merged_file"
     fi
 
+    # Note on the inconclusive penalty (spec §4.4): we DISPLAY a multiplied
+    # confidence (×0.7) on inconclusive findings to communicate uncertainty,
+    # but we ALSO carry the pre-penalty value as `original_confidence_score`
+    # so the location-validator threshold filter doesn't double-jeopardy the
+    # finding. Without this, every inconclusive finding has post-penalty
+    # confidence ≤ 0.7, which is unwinnable against the default 0.8 threshold,
+    # and unconfirmed findings can never surface.
     printf '%s' "$finding" \
       | jq -c --arg verdict "$verdict" \
              --arg agreement "$agreement" \
@@ -2112,10 +2125,11 @@ run_cross_family_verifier() {
                then ((.priority // 0) - 1)
              else (.priority // 0) end) as $new_priority
           | $f
-          | .verifier_verdict = $verdict
-          | .agreement        = $agreement
-          | .confidence_score = $new_conf
-          | .priority         = $new_priority
+          | .verifier_verdict          = $verdict
+          | .agreement                 = $agreement
+          | .confidence_score          = $new_conf
+          | .original_confidence_score = $orig_conf
+          | .priority                  = $new_priority
           | del(._finding_id)
         ' >> "$merged_file"
   done

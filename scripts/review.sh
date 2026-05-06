@@ -2221,7 +2221,10 @@ format_comment() {
   local total_findings filtered_count
 
   total_findings=$(jq '.findings | length' "$output_file")
-  filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(.confidence_score >= ($t | tonumber))] | length' "$output_file")
+  # Threshold gating: prefer pre-penalty `original_confidence_score` so the
+  # inconclusive ×0.7 display penalty doesn't double-jeopardy filter findings.
+  # Falls back to `confidence_score` for confirmed/deterministic/v1 outputs.
+  filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(((.original_confidence_score // .confidence_score) // 0) >= ($t | tonumber))] | length' "$output_file")
 
   local verdict confidence_score explanation
   verdict=$(jq -r '.overall_correctness' "$output_file")
@@ -2367,7 +2370,7 @@ format_comment() {
     done < <(jq -c --arg t "$THRESHOLD" '
       # P3 sort order preserved: priority desc → deterministic first within
       # each priority bucket → title alphabetical (stable tiebreaker).
-      [.findings[] | select(.confidence_score >= ($t | tonumber))]
+      [.findings[] | select(((.original_confidence_score // .confidence_score) // 0) >= ($t | tonumber))]
       | sort_by([
           -((.priority // 0)),
           (if (.source // "") == "deterministic" then 0 else 1 end),
@@ -2713,7 +2716,7 @@ main() {
   # enum, agreement_summary counts, and a delta block on follow-up runs).
   local filtered_count total_findings resolved_count raw_verdict v2_verdict
   total_findings=$(jq '.findings | length' "$WORK_DIR/codex-output.json")
-  filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(.confidence_score >= ($t | tonumber))] | length' "$WORK_DIR/codex-output.json")
+  filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(((.original_confidence_score // .confidence_score) // 0) >= ($t | tonumber))] | length' "$WORK_DIR/codex-output.json")
   resolved_count=$(jq '[.resolved_prior_findings // [] | length] | .[0]' "$WORK_DIR/codex-output.json")
   raw_verdict=$(jq -r '.overall_correctness' "$WORK_DIR/codex-output.json")
   # Same v1→v2 verdict shim format_comment uses (kept consistent).
@@ -2722,7 +2725,7 @@ main() {
   # Agreement summary: count how many findings carry each agreement label.
   local agreement_summary
   agreement_summary=$(jq --arg t "$THRESHOLD" '
-    [.findings[] | select(.confidence_score >= ($t | tonumber))] as $f
+    [.findings[] | select(((.original_confidence_score // .confidence_score) // 0) >= ($t | tonumber))] as $f
     | {
         both:                  ($f | map(select(.agreement == "both"))                  | length),
         codex_only:            ($f | map(select(.agreement == "codex-only"))            | length),

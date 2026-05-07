@@ -381,13 +381,13 @@ detect_pr() {
     # Extract number from URL if needed
     local pr_num
     pr_num=$(echo "$PR_ARG" | grep -oE '[0-9]+$' || echo "$PR_ARG")
-    pr_json=$(gh pr view "$pr_num" --json number,title,headRefName,baseRefName,url 2>/dev/null) || {
+    pr_json=$(gh pr view "$pr_num" --json number,title,headRefName,headRefOid,baseRefName,url 2>/dev/null) || {
       echo "Error: Could not find PR #$pr_num" >&2
       exit 2
     }
   else
     # Auto-detect from current branch
-    pr_json=$(gh pr view --json number,title,headRefName,baseRefName,url 2>/dev/null) || {
+    pr_json=$(gh pr view --json number,title,headRefName,headRefOid,baseRefName,url 2>/dev/null) || {
       echo "Error: No PR found for current branch. Specify a PR number: review.sh 123" >&2
       exit 2
     }
@@ -2021,12 +2021,17 @@ run_cross_family_verifier() {
       local hunk_path="$WORK_DIR/verifier/finding-${fid}-hunk.diff"
       local prompt_file="$WORK_DIR/verifier/finding-${fid}-prompt.md"
 
-      # Read file at HEAD; if it does not exist there, the verifier will
-      # treat the finding as refuted (line cannot exist).
-      if [[ -n "$file_path" ]] && git show "HEAD:${file_path}" > "$file_content_path" 2>/dev/null; then
+      # Read the file at the PR's HEAD (post-change). PR_HEAD_SHA is set in
+      # main() from `gh pr view`'s headRefOid so files added by the PR are
+      # readable even when the local checkout is on a different branch (this
+      # was the medsum#1 root cause: HEAD was the local main, so PR-added
+      # files looked missing and the verifier refuted everything). Falls back
+      # to local HEAD if PR_HEAD_SHA isn't set.
+      local _verifier_ref="${PR_HEAD_SHA:-HEAD}"
+      if [[ -n "$file_path" ]] && git show "${_verifier_ref}:${file_path}" > "$file_content_path" 2>/dev/null; then
         :
       else
-        printf '(file not present at HEAD: %s)\n' "$file_path" > "$file_content_path"
+        printf '(file not present at %s: %s)\n' "$_verifier_ref" "$file_path" > "$file_content_path"
       fi
 
       _extract_diff_hunk "$diff_file" "$file_path" "$start_line" "$hunk_path"
@@ -2565,12 +2570,31 @@ main() {
   local pr_json
   pr_json=$(detect_pr)
 
-  local pr_number pr_title head_branch base_branch pr_url
+  local pr_number pr_title head_branch base_branch pr_url pr_head_sha
   pr_number=$(echo "$pr_json" | jq -r '.number')
   pr_title=$(echo "$pr_json" | jq -r '.title')
   head_branch=$(echo "$pr_json" | jq -r '.headRefName')
   base_branch=$(echo "$pr_json" | jq -r '.baseRefName')
   pr_url=$(echo "$pr_json" | jq -r '.url')
+  pr_head_sha=$(echo "$pr_json" | jq -r '.headRefOid // ""')
+
+  # Ensure the PR's head commit is fetched locally so the verifier can read
+  # files at that SHA (otherwise files added by the PR look "missing" and the
+  # verifier refutes them — this was the medsum#1 bug). Use refs/pull/<n>/head
+  # since it works for cross-fork PRs too. Falls through silently on failure;
+  # the verifier degrades to local HEAD.
+  if [[ -n "$pr_head_sha" ]] && ! git cat-file -e "$pr_head_sha" 2>/dev/null; then
+    git fetch -q origin "refs/pull/${pr_number}/head" 2>/dev/null || \
+      git fetch -q origin "$head_branch" 2>/dev/null || true
+  fi
+  # Final fallback: if we still don't have a usable PR head SHA, use local
+  # HEAD with a warning. This degrades the verifier (it'll see whatever is
+  # locally checked out) but doesn't break the run.
+  if [[ -z "$pr_head_sha" ]] || ! git cat-file -e "$pr_head_sha" 2>/dev/null; then
+    echo "  Warning: could not resolve PR head SHA locally. Verifier will use 'git rev-parse HEAD' for file reads, which may not match the PR." >&2
+    pr_head_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+  fi
+  export PR_HEAD_SHA="$pr_head_sha"
 
   echo "Reviewing PR #$pr_number: $pr_title" >&2
   echo "  Branch: $head_branch → $base_branch" >&2
@@ -2611,9 +2635,12 @@ main() {
     review_iteration=1
   fi
 
-  # Get current HEAD SHA for embedding
+  # SHA used for sentinel embedding + iteration tracking. Prefer the PR's
+  # actual head (resolved via gh pr view above) so the v2 sentinel records
+  # the SHA reviewers actually saw, not whatever happens to be checked out
+  # locally. Falls back to local HEAD if PR_HEAD_SHA is unset.
   local head_sha
-  head_sha=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+  head_sha="${PR_HEAD_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "unknown")}"
 
   # Gather diff — write directly to file to avoid storing huge diffs in bash variables
   echo "Gathering diff..." >&2
